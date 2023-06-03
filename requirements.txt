@@ -1,0 +1,6 @@
+# The chalkpy package defines the decorators
+# needed for creating features and resolvers.
+# There are many extras packages for chalkpy
+# to add first-class support for things like
+# specific SQL dialects.
+chalkpy[runtime,sql,snowflake]

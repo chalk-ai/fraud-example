@@ -1,0 +1,15 @@
+# The chalk.yaml file sits at the root of your
+# project and lets you specify configuration
+# for your environment.
+
+project: Sandbox
+environments:
+
+  # You can list out specific environment names
+  # as keys here, or use the `default` keyword
+  # for configuration that applies to all environments.
+  # See https://docs.chalk.ai/docs/docker for more
+  # information.
+  default:
+    runtime: python310
+    requirements: requirements.txt
