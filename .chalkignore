@@ -1,19 +1,16 @@
 # .gitignore-compatible file for ignoring files with chalk apply
 # Chalk also respects .gitignore
 
-# Ignore test files
-tests/
-
-# We don't need to upload our data science workflows
-scripts/
-
 # Git artifacts
 .git
 .github
 
+# Ignore test files
+tests/
+
 # The API clients we generate are not part of our
 # feature pipelines, so we don't need to upload them
-# to Chalk
+# to Chalk.
 clients
 
 # Typically, you'll ignore the directory in which you're
