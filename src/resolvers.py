@@ -7,7 +7,7 @@ from src.mocks import experian
 def account_name_match(
     title: User.account.title,
     name: User.name,
-):
+) -> User.account_name_match:
     """Docstrings show up in the Chalk dashboard"""
     intersection = set(title) & set(name)
     union = set(title) | set(name)
@@ -18,7 +18,7 @@ def account_name_match(
 def get_fraud_score(
     name: User.name,
     email: User.email,
-) -> Features[User.fraud_score, User.credit_score_tags]:
+) -> Features[User.fico_score, User.credit_score_tags]:
     response = experian.get_credit_score(name, email)
 
     # We don't need to provide all the features for

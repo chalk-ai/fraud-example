@@ -1,4 +1,5 @@
--- Incrementally ingest account data from Snowflake.
+-- Incrementally ingest account balance data from Snowflake.
+-- The `balances` table in this example is an append-only table.
 -- This comment will be searchable in the Chalk dashboard.
 --
 -- resolves: account
@@ -7,10 +8,11 @@
 -- cron: 5m
 -- incremental:
 --   mode: row
+--   incremental_column: updated_at
 --   lookback: 1h
 select
     id,
     user_id,
-    amount,
+    balance,
     updated_at
-from accounts;
+from balances;

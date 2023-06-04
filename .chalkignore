@@ -10,3 +10,8 @@ scripts/
 # Git artifacts
 .git
 .github
+
+# The API clients we generate are not part of our
+# feature pipelines, so we don't need to upload them
+# to Chalk
+clients

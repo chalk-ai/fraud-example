@@ -16,6 +16,9 @@ class User:
     # The account that this user owns.
     account: "Account"
 
+    # The similarity between the user's name and the account's title.
+    account_name_match: float
+
     # The fraud score, as provided by a third-party vendor.
     fico_score: int = feature(min=300, max=850, strict=True)
 
