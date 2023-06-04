@@ -1,3 +1,5 @@
+from enum import Enum
+
 from chalk.features import features, has_one, FeatureTime, feature
 
 
@@ -24,6 +26,31 @@ class User:
 
     # Tags from our credit scoring vendor.
     credit_score_tags: list[str]
+
+
+class TransactionStatus(str, Enum):
+    PENDING = "pending"
+    CLEARED = "cleared"
+    FAILED = "failed"
+
+
+@features
+class Transaction:
+    id: int
+
+    # The id of the account that this transaction belongs to.
+    account_id: int
+
+    # The amount of the transaction, in dollars.
+    amount: float
+
+    # The status of the transaction, defined as an enum above.
+    status: TransactionStatus
+
+    # Because we define the join condition between
+    # `Transaction` and `Account` below, we don't
+    # need to repeat it here.
+    account: "Account"
 
 
 @features(max_staleness="infinity", etl_offline_to_online=True)
