@@ -1,4 +1,5 @@
 from enum import Enum
+from datetime import date
 
 from chalk.features import features, has_one, FeatureTime, feature
 
@@ -46,6 +47,9 @@ class Transaction:
 
     # The status of the transaction, defined as an enum above.
     status: TransactionStatus
+
+    # The date on which the transaction took place.
+    date: date
 
     # Because we define the join condition between
     # `Transaction` and `Account` below, we don't
