@@ -15,3 +15,7 @@ scripts/
 # feature pipelines, so we don't need to upload them
 # to Chalk
 clients
+
+# Typically, you'll ignore the directory in which you're
+# writing notebooks and scripts.
+datascience
