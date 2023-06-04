@@ -8,7 +8,7 @@ def account_name_match(
     title: User.account.title,
     name: User.name,
 ):
-    """Docstrings show up in the Chalk UI"""
+    """Docstrings show up in the Chalk dashboard"""
     intersection = set(title) & set(name)
     union = set(title) | set(name)
     return len(intersection) / len(union)

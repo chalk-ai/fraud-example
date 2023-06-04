@@ -1,0 +1,12 @@
+# .gitignore-compatible file for ignoring files with chalk apply
+# Chalk also respects .gitignore
+
+# Ignore test files
+tests/
+
+# We don't need to upload our data science workflows
+scripts/
+
+# Git artifacts
+.git
+.github
