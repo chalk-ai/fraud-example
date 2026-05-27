@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12,<3.14"
-# dependencies = ["chalkcompute>=1.5.13", "pandas"]
+# dependencies = ["chalkcompute>=1.5.17", "pandas"]
 # ///
 """Refund-abuse investigation agent — Snowflake Summit demo.
 
@@ -27,6 +27,18 @@ Run:
 """
 
 import chalkcompute
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+
+
+@pd.api.extensions.register_dataframe_accessor("chalk")
+class _ChalkAccessor:
+    def __init__(self, df: pd.DataFrame):
+        self._df = df
+
+    def apply(self, fn) -> list:
+        with ThreadPoolExecutor(max_workers=len(self._df)) as ex:
+            return list(ex.map(lambda r: fn(*r[1:]), self._df.itertuples()))
 
 # ── WORKAROUND: force file-shipping to use 'copy' instead of 'volume' ──
 # Scaling-group containers ignore volume mounts, so the SDK's default
@@ -99,9 +111,6 @@ def run_one() -> None:
 def run_fanout(n: int = 50) -> None:
     """Scene 5 — fan out across N historical orders, concurrently."""
     import time
-    from concurrent.futures import ThreadPoolExecutor
-
-    import pandas as pd
 
     known = ["ORD-8823", "ORD-1001", "ORD-4242"]
     reasons = [
@@ -120,11 +129,7 @@ def run_fanout(n: int = 50) -> None:
 
     # ── ONE LINE: fan out N concurrent agent invocations ──
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=n) as ex:
-        decisions = list(ex.map(
-            lambda r: investigate_refund(r.order_id, r.reason),
-            orders.itertuples(),
-        ))
+    decisions = orders.chalk.apply(investigate_refund)
     elapsed = time.time() - t0
 
     orders["decision"] = [d.split("\n")[0].strip() for d in decisions]
