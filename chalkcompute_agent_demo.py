@@ -27,27 +27,6 @@ Run:
 """
 
 import chalkcompute
-import pandas as pd
-from concurrent.futures import ThreadPoolExecutor
-
-
-@pd.api.extensions.register_dataframe_accessor("chalk")
-class _ChalkAccessor:
-    def __init__(self, df: pd.DataFrame):
-        self._df = df
-
-    def apply(self, fn) -> list:
-        with ThreadPoolExecutor(max_workers=len(self._df)) as ex:
-            return list(ex.map(lambda r: fn(*r[1:]), self._df.itertuples()))
-
-# ── WORKAROUND: force file-shipping to use 'copy' instead of 'volume' ──
-# Scaling-group containers ignore volume mounts, so the SDK's default
-# "volume" strategy never ships the handler. "copy" inlines files into the
-# image spec. Remove once the SDK ships the right default.
-_orig_add_local_file = chalkcompute.Image.add_local_file
-chalkcompute.Image.add_local_file = lambda self, src, dest, **kw: _orig_add_local_file(
-    self, src, dest, **{"strategy": "copy", **kw}
-)
 
 
 SYSTEM_PROMPT = (
@@ -103,14 +82,41 @@ def investigate_refund(order_id: str, reason: str) -> str:
     return agent.run_sync(prompt).output
 
 
+_DEMO_ORDERS = {
+    "1": ("ORD-8823", "high risk — 4 prior claims"),
+    "2": ("ORD-1001", "low risk — no prior claims"),
+    "3": ("ORD-4242", "medium risk — 2 prior claims"),
+}
+
+
 def run_one() -> None:
     """Scene 4 — investigate a single refund."""
-    print(investigate_refund("ORD-8823", "Item arrived damaged"))
+    print("\nSelect an order:")
+    for key, (order_id, description) in _DEMO_ORDERS.items():
+        print(f"  {key}. {order_id}  ({description})")
+    choice = input("\nOrder [1]: ").strip() or "1"
+    order_id, _ = _DEMO_ORDERS.get(choice, _DEMO_ORDERS["1"])
+
+    reason = input("Refund reason: ").strip() or "Item arrived damaged"
+
+    print()
+    print(investigate_refund(order_id, reason))
 
 
 def run_fanout(n: int = 50) -> None:
     """Scene 5 — fan out across N historical orders, concurrently."""
     import time
+    import pandas as pd
+    from concurrent.futures import ThreadPoolExecutor
+
+    @pd.api.extensions.register_dataframe_accessor("chalk")
+    class _ChalkAccessor:
+        def __init__(self, df: pd.DataFrame):
+            self._df = df
+
+        def apply(self, fn) -> list:
+            with ThreadPoolExecutor(max_workers=len(self._df)) as ex:
+                return list(ex.map(lambda r: fn(*r[1:]), self._df.itertuples()))
 
     known = ["ORD-8823", "ORD-1001", "ORD-4242"]
     reasons = [

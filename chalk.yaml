@@ -2,7 +2,7 @@
 # project and lets you specify configuration
 # for your environment.
 
-project: Sandbox
+project: Demos
 environments:
 
   # You can list out specific environment names

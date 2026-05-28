@@ -21,14 +21,6 @@ Run:
 
 import chalkcompute
 
-# WORKAROUND: scaling-group / container file-shipping needs strategy="copy".
-# The "volume" default (the SDK's pick) silently drops files for scaling-group
-# containers — internal known gotcha. Remove once SDK ships the right default.
-_orig = chalkcompute.Image.add_local_file
-chalkcompute.Image.add_local_file = lambda self, src, dest, **kw: _orig(
-    self, src, dest, **{"strategy": "copy", **kw}
-)
-
 
 container = chalkcompute.Container(
     image=(
@@ -43,7 +35,7 @@ container = chalkcompute.Container(
     cpu="4",
     memory="16Gi",
     port=8000,
-    lifetime="0s",  # no auto-stop; runs until manually stopped
+    lifetime="3600s",  # 1 hour; rerun this script if the server expires
     secrets=[chalkcompute.Secret.from_local_env("HF_TOKEN")],
     entrypoint=[
         "python3", "-m", "vllm.entrypoints.openai.api_server",
