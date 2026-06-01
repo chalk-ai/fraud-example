@@ -35,7 +35,7 @@ container = chalkcompute.Container(
     cpu="4",
     memory="16Gi",
     port=8000,
-    lifetime="3600s",  # 1 hour; rerun this script if the server expires
+    lifetime="28800s",  # 8 hours; rerun this script if the server expires
     secrets=[chalkcompute.Secret.from_local_env("HF_TOKEN")],
     entrypoint=[
         "python3", "-m", "vllm.entrypoints.openai.api_server",
@@ -50,10 +50,21 @@ container = chalkcompute.Container(
 
 
 if __name__ == "__main__":
-    # First-time deploy needs ~10–15 min: GPU node provisioning + 6GB image
-    # pull + 15GB weight download. 1800s gives plenty of headroom.
-    handle = container.run(ready_timeout=1800)
-    print(f"\nvLLM server is up:  {handle.url}")
-    print(f"Test it:            curl {handle.url}/v1/models")
+    # Reuse an already-running server rather than erroring on the duplicate-name constraint.
+    existing = next(
+        (c for c in chalkcompute.Container.list_all() if c.name == "qwen-vllm-server"),
+        None,
+    )
+    if existing:
+        print("Reusing existing 'qwen-vllm-server' container.")
+        handle = chalkcompute.Container.from_name("qwen-vllm-server")
+    else:
+        # First-time deploy needs ~10–15 min: GPU node provisioning + 6GB image
+        # pull + 15GB weight download. 1800s gives plenty of headroom.
+        handle = container.run(ready_timeout=1800)
+
+    url = handle.info.web_url
+    print(f"\nvLLM server is up:  {url}")
+    print(f"Test it:            curl {url}/v1/models")
     print(f"\nNow add this to your .env so the agent can find it:")
-    print(f"  VLLM_URL={handle.url}")
+    print(f"  VLLM_URL={url}")

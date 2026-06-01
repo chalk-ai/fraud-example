@@ -1,0 +1,27 @@
+# chalk-mcp-gateway config — refund-abuse Summit demo
+#
+# Deploy: chalk-mcp-gateway serve --config gateway/config.toml
+# Mint a token: chalk-mcp-gateway token --name demo-agent
+
+[server]
+listen = "0.0.0.0:8080"
+
+# ── Backends ──────────────────────────────────────────────────────────────────
+
+[[backends]]
+name = "chalk"
+# Chalk's own MCP server (bundled in the Chalk platform)
+url = "${CHALK_MCP_URL}"
+headers = { Authorization = "Bearer ${CHALK_MCP_TOKEN}" }
+
+[[backends]]
+name = "slack"
+# Slack MCP server (https://github.com/modelcontextprotocol/servers/slack)
+url = "https://mcp.slack.com/sse"
+headers = { Authorization = "Bearer ${SLACK_BOT_TOKEN}" }
+
+# ── Policy ────────────────────────────────────────────────────────────────────
+
+[policy]
+# Path is relative to this config file
+rego = "policy.rego"
