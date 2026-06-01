@@ -214,14 +214,17 @@ def _hyp_status(tool_name: str, result: str) -> str:
     return "done"
 
 
-def _agent_thread(messages: list, q: queue.Queue) -> None:
+def _agent_thread(messages: list, q: queue.Queue, followup: bool = False) -> None:
     try:
-        q.put({"type": "plan", "steps": INVESTIGATION_PLAN})
+        if not followup:
+            q.put({"type": "plan", "steps": INVESTIGATION_PLAN})
         llm, _ = _clients()
 
         while True:
             response = llm.chat.completions.create(
-                model=_model, max_tokens=1024, tools=TOOLS, messages=messages,
+                model=_model, max_tokens=1024,
+                tools=TOOLS if not followup else None,
+                messages=messages,
             )
             msg = response.choices[0].message
 
@@ -342,7 +345,7 @@ async def reply(session_id: str, req: ReplyRequest) -> StreamingResponse:
         raise HTTPException(status_code=404, detail="Session not found")
     messages.append({"role": "user", "content": req.message})
     q: queue.Queue = queue.Queue()
-    threading.Thread(target=_agent_thread, args=(messages, q), daemon=True).start()
+    threading.Thread(target=_agent_thread, args=(messages, q, True), daemon=True).start()
     return StreamingResponse(_sse(q), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -535,8 +538,8 @@ HTML = r"""<!DOCTYPE html>
   .submit-btn { background: var(--accent); color: #fff; border: none; border-radius: 10px; padding: 11px 22px; font-size: 14px; font-weight: 600; font-family: inherit; cursor: pointer; transition: opacity 0.15s; white-space: nowrap; }
   .submit-btn:hover:not(:disabled) { opacity: .85; }
   .submit-btn:disabled { opacity: .35; cursor: not-allowed; }
-  .dismiss-btn { background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: 10px; padding: 11px 18px; font-size: 14px; font-family: inherit; cursor: pointer; transition: color 0.15s, border-color 0.15s; white-space: nowrap; display: none; }
-  .dismiss-btn:hover { color: var(--text); border-color: #444; }
+  .dismiss-btn { background: transparent; color: var(--text); border: 1px solid #444; border-radius: 10px; padding: 11px 18px; font-size: 14px; font-family: inherit; cursor: pointer; transition: color 0.15s, border-color 0.15s, background 0.15s; white-space: nowrap; display: none; }
+  .dismiss-btn:hover { background: var(--surface2); border-color: #666; }
 
   @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes pulse { 0%,80%,100% { transform: scale(.55); opacity: .35; } 40% { transform: scale(1); opacity: 1; } }
@@ -674,8 +677,14 @@ function setMode(m) {
     dismiss.style.display = 'inline-block';
     input.focus();
   } else if (m === 'done') {
-    selBtn.disabled = true; input.disabled  = true; submit.disabled = true;
+    selBtn.disabled   = true;
+    input.disabled    = false;
+    input.placeholder = 'Ask a follow-up question…';
+    input.value       = '';
+    submit.disabled   = false;
+    submit.textContent = 'Send →';
     dismiss.style.display = 'inline-block';
+    input.focus();
   }
 }
 
@@ -683,7 +692,7 @@ function setMode(m) {
 
 function primaryAction() {
   if (mode === 'idle')  startInvestigation();
-  else if (mode === 'reply') sendReply();
+  else if (mode === 'reply' || mode === 'done') sendReply();
 }
 
 function startInvestigation() {
@@ -720,7 +729,7 @@ function sendReply() {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({message: text}),
-  }).then(res => streamEvents(res)).catch(() => setMode('done'));
+  }).then(res => streamEvents(res)).catch(() => setMode('reply'));
 }
 
 function dismiss() {
