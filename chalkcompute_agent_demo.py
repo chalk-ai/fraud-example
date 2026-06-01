@@ -216,8 +216,26 @@ def run_fanout(n: int = 50) -> None:
             self._df = df
 
         def apply(self, fn) -> list:
-            with ThreadPoolExecutor(max_workers=len(self._df)) as ex:
-                return list(ex.map(lambda r: fn(*r[1:]), self._df.itertuples()))
+            import random
+            rows = list(self._df.itertuples())
+
+            def call_with_retry(r):
+                delay = 2.0
+                for attempt in range(5):
+                    try:
+                        return fn(*r[1:])
+                    except RuntimeError as e:
+                        if "timeout" in str(e).lower() or "unavailable" in str(e).lower():
+                            if attempt == 4:
+                                raise
+                            jitter = random.uniform(0, delay)
+                            time.sleep(delay + jitter)
+                            delay = min(delay * 2, 30)
+                        else:
+                            raise
+
+            with ThreadPoolExecutor(max_workers=len(rows)) as ex:
+                return list(ex.map(call_with_retry, rows))
 
     known = [1, 2, 3]
     reasons = [
