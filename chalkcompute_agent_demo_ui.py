@@ -343,7 +343,7 @@ async def reply(session_id: str, req: ReplyRequest) -> StreamingResponse:
     messages = _sessions.get(session_id)
     if messages is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    messages.append({"role": "user", "content": req.message})
+    messages.append({"role": "user", "content": req.message + "\n\n(Answer this follow-up question directly and conversationally. Do not re-run the investigation or issue a new verdict.)"})
     q: queue.Queue = queue.Queue()
     threading.Thread(target=_agent_thread, args=(messages, q, True), daemon=True).start()
     return StreamingResponse(_sse(q), media_type="text/event-stream",
