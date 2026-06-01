@@ -3,11 +3,11 @@
 # requires-python = ">=3.12,<3.14"
 # dependencies = ["fastapi", "uvicorn[standard]", "openai", "chalkpy", "python-dotenv"]
 # ///
-"""Refund-abuse agent demo UI.
+"""Refund-abuse agent demo UI — investigation plan edition.
 
-Runs the agent loop locally (for SSE streaming) and calls Chalk for tool
-execution and the LLM server for inference. Supports multi-turn conversation:
-the agent can ask clarifying questions before issuing a verdict.
+Agent discovers that an individually clean refund claim is part of a broader
+suspicious spike, builds an investigation plan, executes it step by step, and
+ESCALATEs with suggested next actions.
 
 Run:
   ./chalkcompute_agent_demo_ui.py
@@ -19,6 +19,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import uuid
 from dotenv import load_dotenv
@@ -27,101 +28,224 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
-load_dotenv()
+# Search for .env from cwd upward so it works regardless of where uv places __file__
+_dir = os.getcwd()
+for _ in range(5):
+    _candidate = os.path.join(_dir, ".env")
+    if os.path.exists(_candidate):
+        load_dotenv(_candidate, override=True)
+        break
+    _dir = os.path.dirname(_dir)
 
 from openai import OpenAI
 from chalk.client import ChalkClient
 
-# ── Option A: self-hosted Qwen2.5-7B on Chalk Compute ────────────────────────
-# _llm = OpenAI(base_url=os.environ["VLLM_URL"] + "/v1", api_key="EMPTY")
-# _model = "Qwen/Qwen2.5-7B-Instruct"
-
-# ── Option B: hosted Claude API (active) ─────────────────────────────────────
-_llm = OpenAI(
-    base_url="https://api.anthropic.com/v1",
-    api_key=os.environ["ANTHROPIC_API_KEY"],
-    default_headers={"anthropic-version": "2023-06-01"},
-)
 _model = "claude-sonnet-4-6"
-_chalk = ChalkClient()
+_llm:   OpenAI      | None = None
+_chalk: ChalkClient | None = None
 
-# Session store: session_id → messages list
+
+def _clients() -> tuple[OpenAI, ChalkClient]:
+    global _llm, _chalk
+    if _llm is None:
+        _llm = OpenAI(
+            base_url="https://api.anthropic.com/v1",
+            api_key=os.environ["ANTHROPIC_API_KEY"],
+            default_headers={"anthropic-version": "2023-06-01"},
+        )
+    if _chalk is None:
+        _chalk = ChalkClient()
+    return _llm, _chalk
+
 _sessions: dict[str, list] = {}
 
 SYSTEM_PROMPT = (
-    "You investigate refund claims for potential abuse. "
-    "You have access to real-time signals from the Chalk feature store — "
-    "always call both get_risk_score and get_prior_refund_count before ruling. "
-    "If you need context your tools don't provide, ask the customer a direct question. "
-    "Only issue a final verdict when you have enough information — "
-    "begin that response with APPROVE, DENY, or ESCALATE on the first line, "
-    "followed by one sentence of reasoning."
+    "You investigate refund claims for potential fraud. "
+    "Always follow this investigation sequence — do not skip steps: "
+    "1. Call get_fraud_prediction to check the user's individual fraud signals. "
+    "2. Call check_refund_volume_trend to check for a broader refund anomaly — do this for every claim regardless of individual signals. "
+    "3. If a volume spike is detected, call investigate_spike_pattern to characterise the suspicious cohort. "
+    "4. Call check_cohort_match to determine how closely this user fits the cohort. "
+    "Issue a verdict only after all four steps. "
+    "If the user is individually clean but matches a suspicious broader pattern (2+ cohort factors), ESCALATE — do not APPROVE in isolation. "
+    "Format your final response exactly as (no markdown, no bullet symbols, no --- separators):\n"
+    "APPROVE|DENY|ESCALATE\n"
+    "<one sentence of reasoning>\n"
+    "NEXT_STEPS: [\"action 1\", \"action 2\", \"action 3\"]"
 )
+
+# ── Investigation plan ────────────────────────────────────────────────────────
+# Hardcoded for now; swap to an LLM-generated plan by replacing INVESTIGATION_PLAN
+# with a pre-tool chat.completions call that returns the same JSON shape.
+
+INVESTIGATION_PLAN = [
+    {"id": "h1", "label": "Check user fraud baseline",          "tool": "get_fraud_prediction"},
+    {"id": "h2", "label": "Check broader refund context",       "tool": "check_refund_volume_trend"},
+    {"id": "h3", "label": "Drill into spike pattern",           "tool": "investigate_spike_pattern"},
+    {"id": "h4", "label": "Assess cohort match for this user",  "tool": "check_cohort_match"},
+]
+
+_TOOL_TO_HYP = {step["tool"]: step["id"] for step in INVESTIGATION_PLAN}
 
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_risk_score",
-            "description": (
-                "Fetch the real-time fraud risk score for an order "
-                "(0.0 = low risk, 1.0 = high risk)."
-            ),
+            "name": "get_fraud_prediction",
+            "description": "Fetch real-time fraud prediction for a user from the Chalk fraud_model named query. Returns is_fraud and name_email_match_score.",
             "parameters": {
                 "type": "object",
-                "properties": {"order_id": {"type": "string"}},
-                "required": ["order_id"],
+                "properties": {"user_id": {"type": "integer"}},
+                "required": ["user_id"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "get_prior_refund_count",
-            "description": "Look up how many prior refund claims this customer has submitted.",
+            "name": "check_refund_volume_trend",
+            "description": "Check whether refund volume over the last 24 hours is anomalous compared to the 30-day baseline.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "investigate_spike_pattern",
+            "description": "Characterise the suspicious refund cohort driving the current spike — account age, email age, filing time, merchant category.",
             "parameters": {
                 "type": "object",
-                "properties": {"order_id": {"type": "string"}},
-                "required": ["order_id"],
+                "properties": {
+                    "time_window": {"type": "string", "description": "e.g. '24h'"},
+                },
+                "required": ["time_window"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_cohort_match",
+            "description": "Check how many characteristics of the suspicious refund cohort this specific user matches.",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "integer"}},
+                "required": ["user_id"],
             },
         },
     },
 ]
 
+# ── Mock aggregate data ───────────────────────────────────────────────────────
+
+_COHORT_MATCH: dict[int, dict] = {
+    # 3/4 match — account is new, email is new, filed at 2am; merchant differs
+    1: {"matches": 3, "total": 4,
+        "matched": ["account_age <45d", "email_age <21d", "filed 01:00–04:30 UTC"],
+        "missed":  ["merchant category"]},
+    # 2/4 match — account older but email suspiciously new (burner?), filing time matches
+    2: {"matches": 2, "total": 4,
+        "matched": ["email_age <21d", "filed 01:00–04:30 UTC"],
+        "missed":  ["account_age", "merchant category"]},
+    # 4/4 match — hits every pattern factor
+    3: {"matches": 4, "total": 4,
+        "matched": ["account_age <45d", "email_age <21d", "filed 01:00–04:30 UTC", "merchant category"],
+        "missed":  []},
+}
+_DEFAULT_COHORT = {"matches": 2, "total": 4,
+                   "matched": ["account_age <45d", "filed 01:00–04:30 UTC"],
+                   "missed":  ["email_age", "merchant category"]}
+
 
 def _run_tool(name: str, inp: dict) -> str:
-    if name == "get_risk_score":
-        ctx = _chalk.query(
-            input={"order.id": inp["order_id"]},
-            output=["order.refund_risk_score"],
-        )
-        return f"{ctx.get_feature_value('order.refund_risk_score'):.2f}"
-    if name == "get_prior_refund_count":
-        ctx = _chalk.query(
-            input={"order.id": inp["order_id"]},
-            output=["order.customer_prior_refunds"],
-        )
-        return str(ctx.get_feature_value("order.customer_prior_refunds"))
-    return "error: unknown tool"
+    _, chalk = _clients()
+    try:
+        if name == "get_fraud_prediction":
+            uid = int(inp["user_id"])
+            ctx = chalk.query(
+                input={"user.id": uid},
+                output=["user.is_fraud", "user.name_email_match_score"],
+                query_name="fraud_model",
+                query_name_version="1.0.0",
+            )
+            is_fraud = ctx.get_feature_value("user.is_fraud")
+            score    = ctx.get_feature_value("user.name_email_match_score")
+            score_str = str(round(score, 1)) if score is not None else "unknown"
+            return f"is_fraud={is_fraud}, name_email_match_score={score_str}"
+
+        if name == "check_refund_volume_trend":
+            return (
+                "Yesterday: 52 refunds (6.4× above 30-day avg of 8.1/day). "
+                "Spike began ~01:00 UTC. STATUS: ANOMALY"
+            )
+
+        if name == "investigate_spike_pattern":
+            return (
+                "44/52 claims in the cohort share: account age <45 days, "
+                "email age <21 days, filed between 01:00–04:30 UTC, "
+                "merchant category: consumer electronics."
+            )
+
+        if name == "check_cohort_match":
+            uid   = int(inp["user_id"])
+            match = _COHORT_MATCH.get(uid, _DEFAULT_COHORT)
+            missed = ", ".join(match["missed"]) if match["missed"] else "none"
+            return (
+                f"{match['matches']}/{match['total']} cohort factors match. "
+                f"Matched: {', '.join(match['matched'])}. "
+                f"Not matched: {missed}."
+            )
+
+        return "error: unknown tool"
+
+    except Exception as e:
+        return f"error: {type(e).__name__}: {e}"
+
+
+def _hyp_status(tool_name: str, result: str) -> str:
+    """Derive a hypothesis status from the tool result."""
+    if tool_name in ("check_refund_volume_trend", "investigate_spike_pattern"):
+        return "alert"
+    if tool_name == "check_cohort_match":
+        m = re.match(r"(\d+)/(\d+)", result)
+        if m and int(m.group(1)) >= 2:
+            return "alert"
+        return "done"
+    return "done"
 
 
 def _agent_thread(messages: list, q: queue.Queue) -> None:
-    """Run one agent turn. Emits tool_call/tool_result events, then either
-    a 'question' (agent needs more info) or 'decision' (final verdict)."""
     try:
+        q.put({"type": "plan", "steps": INVESTIGATION_PLAN})
+        llm, _ = _clients()
+
         while True:
-            response = _llm.chat.completions.create(
+            response = llm.chat.completions.create(
                 model=_model, max_tokens=1024, tools=TOOLS, messages=messages,
             )
             msg = response.choices[0].message
 
             if not msg.tool_calls:
                 text = (msg.content or "").strip()
-                m = re.match(r"(APPROVE|DENY|ESCALATE)", text)
-                if m:
-                    q.put({"type": "decision", "text": text, "verdict": m.group(1)})
+                verdict_match = re.search(r"\b(APPROVE|DENY|ESCALATE)\b", text)
+                if verdict_match:
+                    verdict = verdict_match.group(1)
+                    next_steps: list[str] = []
+                    ns = re.search(r"NEXT_STEPS:\s*(\[.*?\])", text, re.DOTALL)
+                    if ns:
+                        try:
+                            next_steps = json.loads(ns.group(1))
+                        except Exception:
+                            pass
+                    # Strip NEXT_STEPS and find the reasoning after the verdict keyword
+                    reasoning = re.sub(r"NEXT_STEPS:.*", "", text, flags=re.DOTALL).strip()
+                    # Drop everything up to and including the verdict line
+                    reasoning = re.sub(r"^.*?\b(?:APPROVE|DENY|ESCALATE)\b[^\n]*\n?", "", reasoning, flags=re.DOTALL).strip()
+                    # Strip markdown bold/italic markers
+                    body = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", reasoning).strip()
+                    q.put({"type": "decision", "verdict": verdict,
+                           "text": body, "next_steps": next_steps})
                 else:
-                    # Agent is asking a question — append to history and surface to user
                     messages.append({"role": "assistant", "content": text})
                     q.put({"type": "question", "text": text})
                 break
@@ -130,19 +254,28 @@ def _agent_thread(messages: list, q: queue.Queue) -> None:
                 "role": "assistant",
                 "content": msg.content,
                 "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                     for tc in msg.tool_calls
                 ],
             })
+
             for tc in msg.tool_calls:
-                inp = json.loads(tc.function.arguments)
+                inp  = json.loads(tc.function.arguments)
+                hyp  = _TOOL_TO_HYP.get(tc.function.name)
+
                 q.put({"type": "tool_call", "id": tc.id, "name": tc.function.name, "args": inp})
+                if hyp:
+                    q.put({"type": "hypothesis_update", "id": hyp, "status": "running"})
+
                 result = _run_tool(tc.function.name, inp)
+                status = _hyp_status(tc.function.name, result)
+
                 q.put({"type": "tool_result", "id": tc.id, "result": result})
+                if hyp:
+                    q.put({"type": "hypothesis_update", "id": hyp,
+                           "status": status, "summary": result[:90]})
+
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     except Exception as e:
@@ -168,7 +301,7 @@ app = FastAPI()
 
 
 class InvestigateRequest(BaseModel):
-    order_id: str
+    user_id: int
     reason: str
 
 
@@ -185,25 +318,21 @@ async def index() -> HTMLResponse:
 async def investigate(req: InvestigateRequest) -> StreamingResponse:
     session_id = str(uuid.uuid4())
     messages: list = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Order {req.order_id}. Refund reason: {req.reason!r}."},
+        {"role": "system",  "content": SYSTEM_PROMPT},
+        {"role": "user",    "content": f"User {req.user_id}. Refund reason: {req.reason!r}."},
     ]
     _sessions[session_id] = messages
 
     q: queue.Queue = queue.Queue()
     threading.Thread(target=_agent_thread, args=(messages, q), daemon=True).start()
 
-    # Prepend session_id so the client knows which session this is
     async def stream():
         yield f"data: {json.dumps({'type': 'session', 'id': session_id})}\n\n"
         async for chunk in _sse(q):
             yield chunk
 
-    return StreamingResponse(
-        stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/reply/{session_id}")
@@ -211,17 +340,11 @@ async def reply(session_id: str, req: ReplyRequest) -> StreamingResponse:
     messages = _sessions.get(session_id)
     if messages is None:
         raise HTTPException(status_code=404, detail="Session not found")
-
     messages.append({"role": "user", "content": req.message})
-
     q: queue.Queue = queue.Queue()
     threading.Thread(target=_agent_thread, args=(messages, q), daemon=True).start()
-
-    return StreamingResponse(
-        _sse(q),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return StreamingResponse(_sse(q), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.delete("/session/{session_id}")
@@ -256,91 +379,58 @@ HTML = r"""<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    height: 100vh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
+    background: var(--bg); color: var(--text);
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
   }
 
   /* ── Header ── */
   .header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 15px 24px;
-    border-bottom: 1px solid var(--border);
-    flex-shrink: 0;
+    padding: 15px 24px; border-bottom: 1px solid var(--border); flex-shrink: 0;
   }
-  .header-left {
-    display: flex; align-items: center; gap: 10px;
-    font-size: 15px; font-weight: 600; letter-spacing: -0.01em;
-  }
-  .logo {
-    width: 26px; height: 26px; background: var(--accent);
-    border-radius: 7px; display: flex; align-items: center;
-    justify-content: center; font-size: 13px; font-weight: 700;
-  }
-  .model-badge {
-    font-size: 11px; color: var(--muted);
-    background: var(--surface2); border: 1px solid var(--border);
-    border-radius: 20px; padding: 3px 10px;
-    font-family: 'SF Mono', 'Menlo', monospace; letter-spacing: 0.01em;
-  }
+  .header-left { display: flex; align-items: center; gap: 10px; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .logo { width: 26px; height: 26px; background: var(--accent); border-radius: 7px; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; }
+  .model-badge { font-size: 11px; color: var(--muted); background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; font-family: 'SF Mono', 'Menlo', monospace; }
 
-  /* ── Order selector (inline dropdown) ── */
-  .order-sel {
-    position: relative; flex-shrink: 0;
-  }
-  .order-sel-btn {
+  /* ── User selector ── */
+  .user-sel { position: relative; flex-shrink: 0; }
+  .user-sel-btn {
     display: flex; align-items: center; gap: 8px;
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 10px; padding: 11px 14px;
     color: var(--text); font-size: 13px; font-family: 'SF Mono', 'Menlo', monospace;
-    cursor: pointer; white-space: nowrap; transition: border-color 0.15s;
-    user-select: none;
+    cursor: pointer; white-space: nowrap; transition: border-color 0.15s; user-select: none;
   }
-  .order-sel-btn:hover:not(:disabled) { border-color: #333; }
-  .order-sel-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .order-sel-btn.sel-high   { border-color: rgba(239,68,68,.6); }
-  .order-sel-btn.sel-low    { border-color: rgba(34,197,94,.6); }
-  .order-sel-btn.sel-medium { border-color: rgba(245,158,11,.6); }
-  .order-sel-chevron { color: var(--muted); font-size: 10px; transition: transform 0.15s; }
-  .order-sel-btn.open .order-sel-chevron { transform: rotate(180deg); }
-
-  .order-dropdown {
+  .user-sel-btn:hover:not(:disabled) { border-color: #333; }
+  .user-sel-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .user-sel-chevron { color: var(--muted); font-size: 10px; transition: transform 0.15s; }
+  .user-sel-btn.open .user-sel-chevron { transform: rotate(180deg); }
+  .user-dropdown {
     position: absolute; bottom: calc(100% + 8px); left: 0;
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 6px; min-width: 240px;
+    border-radius: 12px; padding: 6px; min-width: 260px;
     box-shadow: 0 -8px 32px rgba(0,0,0,.5);
     display: flex; flex-direction: column; gap: 4px;
     z-index: 100; animation: rise 0.15s ease;
   }
-  .order-option {
+  .user-option {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 9px 12px; border-radius: 8px; cursor: pointer;
-    transition: background 0.1s; user-select: none;
+    padding: 9px 12px; border-radius: 8px; cursor: pointer; transition: background 0.1s; user-select: none;
   }
-  .order-option:hover { background: var(--surface2); }
-  .order-option-id { font-size: 13px; font-weight: 600; font-family: 'SF Mono', 'Menlo', monospace; }
-  .order-option-right { display: flex; align-items: center; gap: 7px; }
+  .user-option:hover { background: var(--surface2); }
+  .user-option-id { font-size: 13px; font-weight: 600; font-family: 'SF Mono', 'Menlo', monospace; }
+  .user-option-right { display: flex; align-items: center; gap: 7px; }
   .risk-badge { font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 7px; border-radius: 4px; }
   .risk-high   { background: rgba(239,68,68,.15);  color: #f87171; }
   .risk-low    { background: rgba(34,197,94,.15);  color: #4ade80; }
   .risk-medium { background: rgba(245,158,11,.15); color: #fbbf24; }
-  .order-desc  { font-size: 11px; color: var(--muted); }
+  .user-desc   { font-size: 11px; color: var(--muted); }
 
   /* ── Chat ── */
-  .chat {
-    flex: 1; overflow-y: auto; padding: 28px 24px;
-    display: flex; flex-direction: column; gap: 22px;
-  }
+  .chat { flex: 1; overflow-y: auto; padding: 28px 24px; display: flex; flex-direction: column; gap: 22px; }
   .chat::-webkit-scrollbar { width: 4px; }
   .chat::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-  .empty-state {
-    flex: 1; display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    gap: 10px; color: var(--muted); pointer-events: none;
-  }
+  .empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--muted); pointer-events: none; }
   .empty-icon { font-size: 36px; opacity: 0.25; }
   .empty-text { font-size: 13px; }
 
@@ -348,59 +438,70 @@ HTML = r"""<!DOCTYPE html>
   .msg-user {
     align-self: flex-end; max-width: 420px;
     background: var(--surface2); border: 1px solid var(--border);
-    border-radius: 16px 16px 4px 16px; padding: 12px 16px;
-    animation: rise 0.2s ease;
+    border-radius: 16px 16px 4px 16px; padding: 12px 16px; animation: rise 0.2s ease;
   }
-  .msg-order-ref { font-size: 11px; color: var(--muted); font-family: monospace; margin-bottom: 4px; }
-  .msg-reason    { font-size: 14px; line-height: 1.4; }
-
-  /* Plain user reply bubble (no order ref) */
+  .msg-user-ref    { font-size: 11px; color: var(--muted); font-family: monospace; margin-bottom: 4px; }
+  .msg-user-reason { font-size: 14px; line-height: 1.4; }
   .msg-reply {
     align-self: flex-end; max-width: 420px;
     background: var(--surface2); border: 1px solid var(--border);
-    border-radius: 16px 16px 4px 16px; padding: 12px 16px;
-    font-size: 14px; line-height: 1.4; animation: rise 0.2s ease;
+    border-radius: 16px 16px 4px 16px; padding: 12px 16px; font-size: 14px; line-height: 1.4; animation: rise 0.2s ease;
   }
-
-  /* Agent question bubble */
   .msg-question {
     align-self: flex-start; max-width: 480px;
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 16px 16px 16px 4px; padding: 12px 16px;
-    font-size: 14px; line-height: 1.55; animation: rise 0.2s ease;
+    border-radius: 16px 16px 16px 4px; padding: 12px 16px; font-size: 14px; line-height: 1.55; animation: rise 0.2s ease;
   }
+  .msg-agent { align-self: flex-start; max-width: 620px; display: flex; flex-direction: column; gap: 8px; animation: rise 0.2s ease; }
 
-  /* Agent tool container */
-  .msg-agent {
-    align-self: flex-start; max-width: 580px;
-    display: flex; flex-direction: column; gap: 8px; animation: rise 0.2s ease;
+  /* ── Plan card ── */
+  .plan-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden; animation: rise 0.2s ease;
   }
+  .plan-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
+  }
+  .plan-step {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 9px 14px; border-bottom: 1px solid var(--border); transition: background 0.2s;
+  }
+  .plan-step:last-child { border-bottom: none; }
+  .plan-step.status-running { background: rgba(99,102,241,.05); }
+  .plan-step.status-done    { background: rgba(34,197,94,.04); }
+  .plan-step.status-alert   { background: rgba(245,158,11,.05); }
+  .step-icon { font-size: 13px; min-width: 16px; margin-top: 1px; }
+  .step-icon.pending  { opacity: 0.3; }
+  .step-icon.running  { animation: spin 1s linear infinite; display: inline-block; }
+  .step-body { display: flex; flex-direction: column; gap: 3px; }
+  .step-label { font-size: 13px; color: var(--text); }
+  .step-label.muted { color: var(--muted); }
+  .step-summary { font-size: 11px; color: var(--muted); font-family: 'SF Mono', 'Menlo', monospace; line-height: 1.4; }
+  .step-summary.alert  { color: #fbbf24; }
+  .step-summary.done   { color: #4ade80; }
 
-  /* Tool card */
+  /* ── Tool card ── */
   .tool-card {
     background: var(--tool-bg); border: 1px solid var(--tool-border);
     border-left: 3px solid var(--accent); border-radius: 8px;
-    padding: 10px 14px; font-family: 'SF Mono', 'Menlo', monospace;
-    font-size: 12px; animation: rise 0.15s ease;
+    padding: 10px 14px; font-family: 'SF Mono', 'Menlo', monospace; font-size: 12px; animation: rise 0.15s ease;
   }
   .tool-header { display: flex; align-items: center; gap: 7px; color: #a5b4fc; margin-bottom: 3px; }
   .tool-fn   { font-weight: 600; }
   .tool-args { color: #4b5563; }
-  .tool-result-row {
-    margin-top: 7px; padding-top: 7px;
-    border-top: 1px solid var(--tool-border);
-    display: flex; align-items: center; gap: 7px;
-  }
+  .tool-result-row { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--tool-border); display: flex; align-items: center; gap: 7px; }
   .tool-result-row.pending { color: var(--muted); }
   .tool-result-row.done    { color: #86efac; }
 
-  /* Thinking dots */
+  /* ── Thinking dots ── */
   .thinking { display: flex; align-items: center; gap: 5px; padding: 8px 2px; }
   .dot { width: 6px; height: 6px; background: var(--muted); border-radius: 50%; animation: pulse 1.2s ease-in-out infinite; }
   .dot:nth-child(2) { animation-delay: .2s; }
   .dot:nth-child(3) { animation-delay: .4s; }
 
-  /* Verdict */
+  /* ── Verdict ── */
   .verdict-card { border-radius: 12px; padding: 16px 20px; border: 1px solid; animation: rise 0.25s ease; }
   .verdict-approve  { background: rgba(34,197,94,.08);  border-color: rgba(34,197,94,.25); }
   .verdict-deny     { background: rgba(239,68,68,.08);  border-color: rgba(239,68,68,.25); }
@@ -411,49 +512,35 @@ HTML = r"""<!DOCTYPE html>
   .verdict-escalate .verdict-label { color: var(--amber); }
   .verdict-text { font-size: 13px; color: #999; line-height: 1.55; }
 
-  /* Error */
-  .error-card {
-    background: rgba(239,68,68,.07); border: 1px solid rgba(239,68,68,.2);
-    border-radius: 8px; padding: 10px 14px; font-size: 13px; color: #fca5a5;
+  /* ── Next steps ── */
+  .next-steps { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; animation: rise 0.3s ease; }
+  .next-steps-header { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); padding: 2px 0 4px; }
+  .next-step-btn {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 14px; font-size: 13px; color: var(--text);
+    font-family: inherit; cursor: default; text-align: left;
   }
+  .next-step-arrow { color: var(--muted); font-size: 11px; }
+
+  /* ── Error ── */
+  .error-card { background: rgba(239,68,68,.07); border: 1px solid rgba(239,68,68,.2); border-radius: 8px; padding: 10px 14px; font-size: 13px; color: #fca5a5; }
 
   /* ── Input bar ── */
-  .input-bar {
-    padding: 14px 24px; border-top: 1px solid var(--border);
-    display: flex; gap: 10px; flex-shrink: 0; align-items: center;
-  }
-  .main-input {
-    flex: 1; background: var(--surface); border: 1px solid var(--border);
-    border-radius: 10px; padding: 11px 16px; color: var(--text);
-    font-size: 14px; font-family: inherit; outline: none; transition: border-color 0.15s;
-  }
+  .input-bar { padding: 14px 24px; border-top: 1px solid var(--border); display: flex; gap: 10px; flex-shrink: 0; align-items: center; }
+  .main-input { flex: 1; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 11px 16px; color: var(--text); font-size: 14px; font-family: inherit; outline: none; transition: border-color 0.15s; }
   .main-input::placeholder { color: var(--muted); }
   .main-input:focus { border-color: #3a3a5a; }
   .main-input:disabled { opacity: 0.4; }
-  .submit-btn {
-    background: var(--accent); color: #fff; border: none;
-    border-radius: 10px; padding: 11px 22px; font-size: 14px; font-weight: 600;
-    font-family: inherit; cursor: pointer; transition: opacity 0.15s; white-space: nowrap;
-  }
+  .submit-btn { background: var(--accent); color: #fff; border: none; border-radius: 10px; padding: 11px 22px; font-size: 14px; font-weight: 600; font-family: inherit; cursor: pointer; transition: opacity 0.15s; white-space: nowrap; }
   .submit-btn:hover:not(:disabled) { opacity: .85; }
   .submit-btn:disabled { opacity: .35; cursor: not-allowed; }
-  .dismiss-btn {
-    background: transparent; color: var(--muted);
-    border: 1px solid var(--border); border-radius: 10px;
-    padding: 11px 18px; font-size: 14px; font-family: inherit;
-    cursor: pointer; transition: color 0.15s, border-color 0.15s; white-space: nowrap;
-    display: none;
-  }
+  .dismiss-btn { background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: 10px; padding: 11px 18px; font-size: 14px; font-family: inherit; cursor: pointer; transition: color 0.15s, border-color 0.15s; white-space: nowrap; display: none; }
   .dismiss-btn:hover { color: var(--text); border-color: #444; }
 
-  @keyframes rise {
-    from { opacity: 0; transform: translateY(6px); }
-    to   { opacity: 1; transform: translateY(0); }
-  }
-  @keyframes pulse {
-    0%,80%,100% { transform: scale(.55); opacity: .35; }
-    40%          { transform: scale(1);   opacity: 1; }
-  }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes pulse { 0%,80%,100% { transform: scale(.55); opacity: .35; } 40% { transform: scale(1); opacity: 1; } }
+  @keyframes spin  { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -472,43 +559,42 @@ HTML = r"""<!DOCTYPE html>
 <div class="chat" id="chat">
   <div class="empty-state" id="emptyState">
     <div class="empty-icon">⚖</div>
-    <div class="empty-text">Select an order and describe the refund reason to begin</div>
+    <div class="empty-text">Select a user and describe the refund reason to begin</div>
   </div>
 </div>
 
 <div class="input-bar">
-  <div class="order-sel" id="orderSel">
-    <button class="order-sel-btn" id="orderSelBtn" onclick="toggleDropdown()">
-      <span id="orderSelLabel">Select order</span>
-      <span class="order-sel-chevron">▾</span>
+  <div class="user-sel" id="userSel">
+    <button class="user-sel-btn" id="userSelBtn" onclick="toggleDropdown()">
+      <span id="userSelLabel">Select user</span>
+      <span class="user-sel-chevron">▾</span>
     </button>
-    <div class="order-dropdown" id="orderDropdown" style="display:none">
-      <div class="order-option" onclick="selectOrder('ORD-8823','high')">
-        <span class="order-option-id">ORD-8823</span>
-        <div class="order-option-right">
-          <span class="risk-badge risk-high">High Risk</span>
-          <span class="order-desc">4 prior claims</span>
+    <div class="user-dropdown" id="userDropdown" style="display:none">
+      <div class="user-option" onclick="selectUser(1,'medium')">
+        <span class="user-option-id">user_id=1</span>
+        <div class="user-option-right">
+          <span class="risk-badge risk-medium">Medium</span>
+          <span class="user-desc">acct age 38d</span>
         </div>
       </div>
-      <div class="order-option" onclick="selectOrder('ORD-1001','low')">
-        <span class="order-option-id">ORD-1001</span>
-        <div class="order-option-right">
-          <span class="risk-badge risk-low">Low Risk</span>
-          <span class="order-desc">No prior claims</span>
+      <div class="user-option" onclick="selectUser(2,'low')">
+        <span class="user-option-id">user_id=2</span>
+        <div class="user-option-right">
+          <span class="risk-badge risk-low">Low</span>
+          <span class="user-desc">acct age 4y</span>
         </div>
       </div>
-      <div class="order-option" onclick="selectOrder('ORD-4242','medium')">
-        <span class="order-option-id">ORD-4242</span>
-        <div class="order-option-right">
-          <span class="risk-badge risk-medium">Medium Risk</span>
-          <span class="order-desc">2 prior claims</span>
+      <div class="user-option" onclick="selectUser(3,'high')">
+        <span class="user-option-id">user_id=3</span>
+        <div class="user-option-right">
+          <span class="risk-badge risk-high">New</span>
+          <span class="user-desc">acct age 22d</span>
         </div>
       </div>
     </div>
   </div>
   <input id="mainInput" class="main-input" type="text"
-         placeholder="Select an order first…"
-         value=""
+         placeholder="Select a user first…"
          disabled
          onkeydown="if(event.key==='Enter')primaryAction()">
   <button id="dismissBtn" class="dismiss-btn" onclick="dismiss()">New investigation</button>
@@ -516,89 +602,84 @@ HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
-let selectedOrder  = null;
-let selectedRisk   = null;
+let selectedUser   = null;
 let sessionId      = null;
-let mode           = 'idle';   // 'idle' | 'thinking' | 'reply' | 'done'
+let mode           = 'idle';
 let activeAgentMsg = null;
 let activeThinking = null;
+let planCard       = null;
+
+// ── Dropdown ──────────────────────────────────────────────────────────────────
 
 function toggleDropdown() {
-  const btn  = document.getElementById('orderSelBtn');
-  const menu = document.getElementById('orderDropdown');
+  const btn  = document.getElementById('userSelBtn');
+  const menu = document.getElementById('userDropdown');
   const open = menu.style.display !== 'none';
   menu.style.display = open ? 'none' : 'flex';
   btn.classList.toggle('open', !open);
 }
 
-function selectOrder(id, risk) {
+function selectUser(id, risk) {
   if (sessionId) dismiss();
-  selectedOrder = id;
-  selectedRisk  = risk;
+  selectedUser = id;
 
-  const btn   = document.getElementById('orderSelBtn');
-  const label = document.getElementById('orderSelLabel');
-  label.textContent = id;
-  btn.className = `order-sel-btn sel-${risk}`;
-
-  document.getElementById('orderDropdown').style.display = 'none';
+  const btn   = document.getElementById('userSelBtn');
+  const label = document.getElementById('userSelLabel');
+  label.textContent = `user_id=${id}`;
+  btn.className = `user-sel-btn`;
+  document.getElementById('userDropdown').style.display = 'none';
 
   const input  = document.getElementById('mainInput');
   const submit = document.getElementById('submitBtn');
   input.disabled    = false;
   input.placeholder = 'Describe the refund reason…';
-  input.value       = 'Item arrived damaged';
+  input.value       = 'Item not as described';
   submit.disabled   = false;
-  input.focus();
-  input.select();
+  input.focus(); input.select();
 }
 
-// Close dropdown on outside click
 document.addEventListener('click', e => {
-  const sel = document.getElementById('orderSel');
+  const sel = document.getElementById('userSel');
   if (sel && !sel.contains(e.target)) {
-    document.getElementById('orderDropdown').style.display = 'none';
-    document.getElementById('orderSelBtn').classList.remove('open');
+    document.getElementById('userDropdown').style.display = 'none';
+    document.getElementById('userSelBtn').classList.remove('open');
   }
 });
+
+// ── Mode ──────────────────────────────────────────────────────────────────────
 
 function setMode(m) {
   mode = m;
   const input   = document.getElementById('mainInput');
   const submit  = document.getElementById('submitBtn');
   const dismiss = document.getElementById('dismissBtn');
-  const selBtn  = document.getElementById('orderSelBtn');
+  const selBtn  = document.getElementById('userSelBtn');
 
   if (m === 'idle') {
     selBtn.disabled   = false;
     input.disabled    = false;
-    input.placeholder = selectedOrder ? 'Describe the refund reason…' : 'Select an order first…';
-    input.value       = selectedOrder ? 'Item arrived damaged' : '';
-    submit.disabled   = !selectedOrder;
+    input.placeholder = selectedUser ? 'Describe the refund reason…' : 'Select a user first…';
+    input.value       = selectedUser ? 'Item not as described' : '';
+    submit.disabled   = !selectedUser;
     submit.textContent = 'Investigate →';
     dismiss.style.display = 'none';
-    if (selectedOrder) input.focus();
+    if (selectedUser) input.focus();
   } else if (m === 'thinking') {
-    selBtn.disabled = true;
-    input.disabled  = true;
-    submit.disabled = true;
+    selBtn.disabled = true; input.disabled  = true; submit.disabled = true;
     dismiss.style.display = 'inline-block';
   } else if (m === 'reply') {
     selBtn.disabled   = true;
-    input.disabled    = false;
-    input.placeholder = 'Reply to agent…';
-    input.value       = '';
-    submit.disabled   = false;
-    submit.textContent = 'Send →';
+    input.disabled    = false; input.placeholder = 'Reply to agent…'; input.value = '';
+    submit.disabled   = false; submit.textContent = 'Send →';
     dismiss.style.display = 'inline-block';
     input.focus();
   } else if (m === 'done') {
-    selBtn.disabled = true;
-    input.disabled  = true;
-    submit.disabled = true;
+    selBtn.disabled = true; input.disabled  = true; submit.disabled = true;
     dismiss.style.display = 'inline-block';
   }
 }
+
+// ── Actions ───────────────────────────────────────────────────────────────────
 
 function primaryAction() {
   if (mode === 'idle')  startInvestigation();
@@ -606,23 +687,22 @@ function primaryAction() {
 }
 
 function startInvestigation() {
-  if (!selectedOrder) return;
+  if (!selectedUser) return;
   const reason = document.getElementById('mainInput').value.trim();
   if (!reason) return;
 
-  const chat = document.getElementById('chat');
   document.getElementById('emptyState')?.remove();
   setMode('thinking');
-
   document.getElementById('newBtn').style.display = 'inline-block';
-  appendUserBubble(selectedOrder, reason);
+
+  appendUserBubble(selectedUser, reason);
   activeAgentMsg = appendAgentMsg();
   scrollBottom();
 
   fetch('/investigate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({order_id: selectedOrder, reason}),
+    body: JSON.stringify({user_id: selectedUser, reason}),
   }).then(res => streamEvents(res)).catch(() => setMode('idle'));
 }
 
@@ -644,21 +724,18 @@ function sendReply() {
 }
 
 function dismiss() {
-  if (sessionId) {
-    fetch(`/session/${sessionId}`, {method: 'DELETE'}).catch(() => {});
-    sessionId = null;
-  }
-  activeAgentMsg = null;
-  activeThinking = null;
+  if (sessionId) { fetch(`/session/${sessionId}`, {method: 'DELETE'}).catch(() => {}); sessionId = null; }
+  activeAgentMsg = null; activeThinking = null; planCard = null;
   document.getElementById('chat').innerHTML =
     '<div class="empty-state" id="emptyState">' +
-      '<div class="empty-icon">⚖</div>' +
-      '<div class="empty-text">Select an order and describe the refund reason to begin</div>' +
-    '</div>';
-  document.getElementById('orderSelBtn').disabled = false;
+    '<div class="empty-icon">⚖</div>' +
+    '<div class="empty-text">Select a user and describe the refund reason to begin</div></div>';
+  document.getElementById('userSelBtn').disabled = false;
   document.getElementById('newBtn').style.display = 'none';
   setMode('idle');
 }
+
+// ── SSE stream ────────────────────────────────────────────────────────────────
 
 function streamEvents(res) {
   const reader  = res.body.getReader();
@@ -682,22 +759,53 @@ function streamEvents(res) {
   })();
 }
 
+// ── Event handler ─────────────────────────────────────────────────────────────
+
 function handleEvent(ev) {
   if (ev.type === 'session') {
     sessionId = ev.id;
 
+  } else if (ev.type === 'plan') {
+    activeThinking.style.display = 'none';
+    planCard = buildPlanCard(ev.steps);
+    activeAgentMsg.insertBefore(planCard, activeThinking);
+    activeThinking.style.display = '';
+
+  } else if (ev.type === 'hypothesis_update') {
+    if (!planCard) return;
+    const row  = planCard.querySelector(`[data-hyp="${ev.id}"]`);
+    if (!row) return;
+    const icon    = row.querySelector('.step-icon');
+    const label   = row.querySelector('.step-label');
+    const summary = row.querySelector('.step-summary');
+    row.className = `plan-step status-${ev.status}`;
+
+    if (ev.status === 'running') {
+      icon.textContent = '↻'; icon.className = 'step-icon running';
+      label.className  = 'step-label';
+    } else if (ev.status === 'done') {
+      icon.textContent = '✓'; icon.className = 'step-icon';
+      icon.style.color = 'var(--green)';
+      label.className  = 'step-label';
+    } else if (ev.status === 'alert') {
+      icon.textContent = '⚠'; icon.className = 'step-icon';
+      icon.style.color = 'var(--amber)';
+      label.className  = 'step-label';
+    }
+    if (ev.summary) {
+      summary.textContent = ev.summary;
+      summary.className   = `step-summary ${ev.status === 'alert' ? 'alert' : 'done'}`;
+    }
+
   } else if (ev.type === 'tool_call') {
     activeThinking.style.display = 'none';
-    const args = Object.entries(ev.args).map(([k, v]) => `${k}='${v}'`).join(', ');
+    const args = Object.entries(ev.args).map(([k,v]) => `${k}=${JSON.stringify(v)}`).join(', ');
     const card = document.createElement('div');
-    card.className = 'tool-card';
-    card.id = 'tc-' + ev.id;
+    card.className = 'tool-card'; card.id = 'tc-' + ev.id;
     card.innerHTML =
-      `<div class="tool-header"><span>⚙</span>` +
-      `<span class="tool-fn">${esc(ev.name)}</span>` +
+      `<div class="tool-header"><span>⚙</span><span class="tool-fn">${esc(ev.name)}</span>` +
       `<span class="tool-args">(${esc(args)})</span></div>` +
-      `<div class="tool-result-row pending" id="tr-${esc(ev.id)}">` +
-        mkThinking().outerHTML + `</div>`;
+      `<div class="tool-result-row pending" id="tr-${esc(ev.id)}">${mkThinking().outerHTML}</div>`;
     activeAgentMsg.insertBefore(card, activeThinking);
 
   } else if (ev.type === 'tool_result') {
@@ -706,31 +814,39 @@ function handleEvent(ev) {
     activeThinking.style.display = '';
 
   } else if (ev.type === 'question') {
-    activeThinking.remove();
-    activeThinking = null;
+    activeThinking.remove(); activeThinking = null;
     const bubble = document.createElement('div');
-    bubble.className = 'msg-question';
-    bubble.textContent = ev.text;
+    bubble.className = 'msg-question'; bubble.textContent = ev.text;
     activeAgentMsg.appendChild(bubble);
     setMode('reply');
 
   } else if (ev.type === 'decision') {
-    activeThinking.remove();
-    activeThinking = null;
-    const lines = ev.text.split('\n').map(l => l.trim()).filter(Boolean);
-    const body  = lines.slice(1).join(' ') || lines[0].replace(/^(APPROVE|DENY|ESCALATE)[:\s–-]*/i, '');
-    const v     = ev.verdict.toLowerCase();
-    const card  = document.createElement('div');
+    activeThinking.remove(); activeThinking = null;
+    const v = ev.verdict.toLowerCase();
+
+    const card = document.createElement('div');
     card.className = `verdict-card verdict-${v}`;
-    card.innerHTML = `<div class="verdict-label">${esc(ev.verdict)}</div><div class="verdict-text">${esc(body)}</div>`;
+    card.innerHTML = `<div class="verdict-label">${esc(ev.verdict)}</div><div class="verdict-text">${esc(ev.text)}</div>`;
     activeAgentMsg.appendChild(card);
+
+    if (ev.next_steps && ev.next_steps.length) {
+      const ns = document.createElement('div');
+      ns.className = 'next-steps';
+      ns.innerHTML = '<div class="next-steps-header">Suggested next steps</div>';
+      ev.next_steps.forEach(step => {
+        const btn = document.createElement('div');
+        btn.className = 'next-step-btn';
+        btn.innerHTML = `<span class="next-step-arrow">→</span><span>${esc(step)}</span>`;
+        ns.appendChild(btn);
+      });
+      activeAgentMsg.appendChild(ns);
+    }
     setMode('done');
 
   } else if (ev.type === 'error') {
     activeThinking?.remove();
     const card = document.createElement('div');
-    card.className = 'error-card';
-    card.textContent = '⚠ ' + ev.message;
+    card.className = 'error-card'; card.textContent = '⚠ ' + ev.message;
     activeAgentMsg.appendChild(card);
     setMode('done');
   }
@@ -738,33 +854,50 @@ function handleEvent(ev) {
   scrollBottom();
 }
 
-function appendUserBubble(orderId, reason) {
+// ── DOM helpers ───────────────────────────────────────────────────────────────
+
+function buildPlanCard(steps) {
+  const card = document.createElement('div');
+  card.className = 'plan-card';
+  card.innerHTML = '<div class="plan-header">🔍 Investigation Plan</div>';
+  steps.forEach(s => {
+    const row = document.createElement('div');
+    row.className = 'plan-step';
+    row.dataset.hyp = s.id;
+    row.innerHTML =
+      `<span class="step-icon pending">○</span>` +
+      `<div class="step-body">` +
+        `<span class="step-label muted">${esc(s.label)}</span>` +
+        `<span class="step-summary"></span>` +
+      `</div>`;
+    card.appendChild(row);
+  });
+  return card;
+}
+
+function appendUserBubble(userId, reason) {
   const el = document.createElement('div');
   el.className = 'msg-user';
-  el.innerHTML = `<div class="msg-order-ref">${esc(orderId)}</div><div class="msg-reason">${esc(reason)}</div>`;
+  el.innerHTML = `<div class="msg-user-ref">user_id=${esc(userId)}</div><div class="msg-user-reason">${esc(reason)}</div>`;
   document.getElementById('chat').appendChild(el);
 }
 
 function appendReplyBubble(text) {
   const el = document.createElement('div');
-  el.className = 'msg-reply';
-  el.textContent = text;
+  el.className = 'msg-reply'; el.textContent = text;
   document.getElementById('chat').appendChild(el);
 }
 
 function appendAgentMsg() {
   const el = document.createElement('div');
   el.className = 'msg-agent';
-  const t = mkThinking();
-  el.appendChild(t);
-  activeThinking = t;
+  const t = mkThinking(); el.appendChild(t); activeThinking = t;
   document.getElementById('chat').appendChild(el);
   return el;
 }
 
 function mkThinking() {
-  const el = document.createElement('div');
-  el.className = 'thinking';
+  const el = document.createElement('div'); el.className = 'thinking';
   el.innerHTML = '<div class="dot"></div><div class="dot"></div><div class="dot"></div>';
   return el;
 }
