@@ -73,14 +73,9 @@ def split_verdict(raw: str) -> tuple[str | None, str]:
 
 
 def parse_steps(raw: str) -> list[dict]:
-    """Reconstruct the ordered tool calls from the trace.
-
-    Each step carries its char offset (`end`) within trace_block(raw) so we can
-    type the transcript out in step-sized slices.
-    """
-    block = trace_block(raw)
+    """Reconstruct the ordered tool calls from the trace."""
     steps = []
-    for i, m in enumerate(_STEP_RE.finditer(block)):
+    for i, m in enumerate(_STEP_RE.finditer(trace_block(raw))):
         name, args, result = m.group(1), m.group(2), m.group(3)
         steps.append({
             "id": f"s{i}",
@@ -88,7 +83,6 @@ def parse_steps(raw: str) -> list[dict]:
             "label": _step_label(name, args),
             "args": _parse_args(args),
             "result": result.strip(),
-            "end": m.end(),
         })
     return steps
 
@@ -137,19 +131,13 @@ def trace_url(start_s: float, end_s: float) -> str:
             f"/environments/{ENV_ID}/scaling-groups/{sg}?{qs}")
 
 
-# Typing cadence for the simulated live reveal (see _producer).
-_TYPE_CHUNK = 12      # characters emitted per delta
-_TYPE_DELAY = 0.022   # seconds between delta slices
-
-
 def _producer(user_id: int, reason: str, q: queue.Queue) -> None:
-    """Call the agent (chalk_client), then reveal its reply as a token-by-token stream.
+    """Call the agent (chalk_client), then narrate the investigation.
 
-    The agent's reply is the flat `"{trace}\n\n{verdict}"` text. We pace the
-    server→browser emission ourselves — type the trace into the chat transcript in
-    slices and reveal each tree node (spinning → done) as its line types out —
-    because the compute transport buffers the agent's output to completion. If the
-    platform later flushes incrementally, this paced replay becomes a pass-through.
+    The left chat shows brief status — preparing, then executing — while the
+    right-hand tree does the work: one node per tool call (spinning → done),
+    finishing with the verdict. We pace the server→browser emission ourselves
+    because the compute transport buffers the agent's output to completion.
     """
     try:
         t0 = time.time()
@@ -157,24 +145,20 @@ def _producer(user_id: int, reason: str, q: queue.Queue) -> None:
         url = trace_url(t0, time.time())
 
         verdict, text = split_verdict(raw)
-        trace = trace_block(raw)
         steps = parse_steps(raw)
 
-        pos = 0
+        # Left chat: short status beats (the detail lives in the tree on the right).
+        q.put({"type": "status", "text": "Agent preparing investigation plan…"})
+        time.sleep(1.0)
+        q.put({"type": "status", "text": "Agent executing plan…"})
+        time.sleep(0.6)
+
+        # Right tree: reveal a node per tool call, paced.
         for s in steps:
             q.put({"type": "tree_node", "id": s["id"], "label": s["label"], "tool": s["tool"]})
-            seg = trace[pos:s["end"]]
-            for j in range(0, len(seg), _TYPE_CHUNK):
-                q.put({"type": "delta", "text": seg[j:j + _TYPE_CHUNK]})
-                time.sleep(_TYPE_DELAY)
-            pos = s["end"]
-            time.sleep(0.15)
+            time.sleep(0.5)
             q.put({"type": "tree_node_done", "id": s["id"], "result": s["result"]})
-            time.sleep(0.15)
-
-        tail = trace[pos:]
-        if tail.strip():
-            q.put({"type": "delta", "text": tail})
+            time.sleep(0.35)
 
         if verdict:
             time.sleep(0.2)
@@ -412,9 +396,9 @@ HTML = r"""<!DOCTYPE html>
   }
   .hyp-icon.spinning { animation: spin 1s linear infinite; color: var(--accent); }
 
-  /* ── CONCLUSION node (left/top set by JS) ── */
+  /* ── CONCLUSION node (left/top set by JS) — just the verdict ── */
   #tree-conclusion {
-    width: 320px; min-height: 86px;
+    width: 320px;
     display: none;
   }
   #tree-conclusion.show { display: block; animation: popIn 0.45s cubic-bezier(.16,1,.3,1); }
@@ -422,13 +406,12 @@ HTML = r"""<!DOCTYPE html>
   #tree-conclusion.verdict-deny     { background: var(--red-bg);   border-color: var(--red-bd); }
   #tree-conclusion.verdict-escalate { background: var(--amber-bg); border-color: var(--amber-bd); }
   #tree-conclusion .conc-label {
-    font-size: 13px; font-weight: 700; letter-spacing: .06em; margin-bottom: 5px;
-    display: flex; align-items: center; gap: 6px;
+    font-size: 14px; font-weight: 700; letter-spacing: .06em;
+    display: flex; align-items: center; gap: 7px;
   }
   #tree-conclusion.verdict-approve  .conc-label { color: var(--green-text); }
   #tree-conclusion.verdict-deny     .conc-label { color: var(--red-text); }
   #tree-conclusion.verdict-escalate .conc-label { color: var(--amber-text); }
-  #tree-conclusion .conc-text { font-size: 11px; color: var(--text2); line-height: 1.45; }
 
   /* ── SVG connector lines ── */
   .tree-svg {
@@ -595,21 +578,12 @@ HTML = r"""<!DOCTYPE html>
   .tool-result-row.pending { color: var(--muted); }
   .tool-result-row.done    { color: var(--green-text); }
 
-  /* ── Live stream transcript ── */
-  .stream-pre {
-    font-family: 'JetBrains Mono', 'SF Mono', 'Menlo', monospace;
-    font-size: 12px; line-height: 1.55; color: var(--text2);
-    white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
-    background: var(--tool-bg); border: 1px solid var(--tool-border);
-    border-left: 3px solid var(--accent); border-radius: 8px;
-    padding: 10px 14px; margin: 0; animation: rise 0.15s ease;
+  /* ── Agent status line ── */
+  .msg-status {
+    align-self: flex-start; display: flex; align-items: center; gap: 11px;
+    padding: 4px 2px; font-size: 14px; color: var(--text2); animation: rise 0.2s ease;
   }
-  .stream-cursor {
-    display: inline-block; width: 7px; height: 13px; background: var(--accent);
-    margin-left: 2px; vertical-align: -2px; border-radius: 1px;
-    animation: blink 1s steps(1, end) infinite;
-  }
-  @keyframes blink { 50% { opacity: 0; } }
+  .msg-status .thinking { padding: 0; }
 
   /* ── Thinking dots ── */
   .thinking { display: flex; align-items: center; gap: 5px; padding: 8px 2px; }
@@ -767,7 +741,7 @@ let sessionId      = null;
 let mode           = 'idle';
 let activeAgentMsg = null;
 let activeThinking = null;
-let activeStreamPre = null;
+let activeStatus   = null;
 
 function traceLinkHtml(url) {
   if (!url) return '';
@@ -933,8 +907,8 @@ function handleEvent(ev) {
   if (ev.type === 'session') {
     sessionId = ev.id;
 
-  } else if (ev.type === 'delta') {
-    appendStream(ev.text);
+  } else if (ev.type === 'status') {
+    setStatus(ev.text);
 
   } else if (ev.type === 'tree_node') {
     ensureTreeScaffold();
@@ -945,7 +919,7 @@ function handleEvent(ev) {
     updateTreeHyp(ev.id, 'done', ev.result || '');
 
   } else if (ev.type === 'question') {
-    finalizeStream();
+    finalizeStatus();
     const bubble = document.createElement('div');
     bubble.className = 'msg-question'; bubble.textContent = ev.text;
     activeAgentMsg.appendChild(bubble);
@@ -953,7 +927,7 @@ function handleEvent(ev) {
     setMode('reply');
 
   } else if (ev.type === 'decision') {
-    finalizeStream();
+    finalizeStatus();
     const v = ev.verdict.toLowerCase();
 
     const card = document.createElement('div');
@@ -963,12 +937,12 @@ function handleEvent(ev) {
                      traceLinkHtml(ev.trace_url);
     activeAgentMsg.appendChild(card);
 
-    renderTreeConclusion(ev.verdict, ev.text);
+    renderTreeConclusion(ev.verdict);
     endTreeIfNoPlan();
     setMode('done');
 
   } else if (ev.type === 'error') {
-    finalizeStream();
+    finalizeStatus();
     const card = document.createElement('div');
     card.className = 'error-card'; card.textContent = '⚠ ' + ev.message;
     activeAgentMsg.appendChild(card);
@@ -979,26 +953,24 @@ function handleEvent(ev) {
   scrollBottom();
 }
 
-// Live transcript: text deltas type into a monospace block with a blinking cursor.
-function appendStream(text) {
-  if (!activeStreamPre) {
-    if (activeThinking) { activeThinking.remove(); activeThinking = null; }
-    const pre = document.createElement('div');
-    pre.className = 'stream-pre';
-    pre.innerHTML = '<span class="stream-text"></span><span class="stream-cursor"></span>';
-    activeAgentMsg.appendChild(pre);
-    activeStreamPre = pre;
+// Left chat: a single status line the agent updates (preparing → executing …),
+// with animated dots. The detailed work shows in the tree on the right.
+function setStatus(text) {
+  if (activeThinking) { activeThinking.remove(); activeThinking = null; }
+  if (!activeStatus) {
+    activeStatus = document.createElement('div');
+    activeStatus.className = 'msg-status';
+    const t = document.createElement('span'); t.className = 'status-text';
+    activeStatus.appendChild(t);
+    activeStatus.appendChild(mkThinking());
+    activeAgentMsg.appendChild(activeStatus);
   }
-  activeStreamPre.querySelector('.stream-text').textContent += text;
+  activeStatus.querySelector('.status-text').textContent = text;
 }
 
-function finalizeStream() {
+function finalizeStatus() {
   if (activeThinking) { activeThinking.remove(); activeThinking = null; }
-  if (activeStreamPre) {
-    const cur = activeStreamPre.querySelector('.stream-cursor');
-    if (cur) cur.remove();
-    activeStreamPre = null;
-  }
+  if (activeStatus) { activeStatus.remove(); activeStatus = null; }
 }
 
 // ── DOM helpers ───────────────────────────────────────────────────────────────
@@ -1020,7 +992,7 @@ function appendAgentMsg() {
   const el = document.createElement('div');
   el.className = 'msg-agent';
   const t = mkThinking(); el.appendChild(t); activeThinking = t;
-  activeStreamPre = null;
+  activeStatus = null;
   document.getElementById('chat').appendChild(el);
   return el;
 }
@@ -1100,7 +1072,6 @@ function ensureTreeScaffold() {
     + `</div>`
     + `<div class="tree-node" id="tree-conclusion" style="width:${CONC_W}px;">`
     +   `<div class="conc-label" id="tree-conc-label">—</div>`
-    +   `<div class="conc-text"  id="tree-conc-text"></div>`
     + `</div>`;
 
   canvas.style.display = 'block';
@@ -1222,7 +1193,7 @@ function updateTreeHyp(id, status, summary) {
   drawEdges();
 }
 
-function renderTreeConclusion(verdict, text) {
+function renderTreeConclusion(verdict) {
   const v    = verdict.toLowerCase();
   const node = document.getElementById('tree-conclusion');
   if (!node) return;
@@ -1230,11 +1201,10 @@ function renderTreeConclusion(verdict, text) {
   node.style.display = 'block';
   void node.offsetWidth; node.classList.add('show');
 
+  // The right-hand node is just the verdict; the reasoning lives in the chat card.
   const glyph = v === 'approve' ? '✓' : v === 'deny' ? '✕' : '⚠';
   document.getElementById('tree-conc-label').innerHTML =
     `<span>${glyph}</span><span>${esc(verdict)}</span>`;
-  const textEl = document.getElementById('tree-conc-text');
-  textEl.textContent = text.length > 120 ? text.slice(0, 117) + '…' : text;
 
   setEdge('e-conc', v === 'approve' ? 'edge-done' : v === 'deny' ? 'edge-deny' : 'edge-alert');
   drawEdges();
