@@ -12,10 +12,9 @@ from dotenv import load_dotenv
 load_dotenv()  # reads .env for Chalk credentials
 
 # resolve deployed agent by name — no URL, no client wiring
-investigate_refund = RemoteFunction.from_name("investigate_refund")
-agent = investigate_refund  # uniform handle for the UI's console trace link
+agent = RemoteFunction.from_name("investigate_refund")
 
 
 # call the agent — runs server-side in Chalk Compute, we get text back
 def investigate(user_id: int, reason: str) -> str:
-    return "".join(investigate_refund.remote(user_id, reason))
+    return "".join(agent.remote(user_id, reason))

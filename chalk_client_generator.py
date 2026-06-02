@@ -13,10 +13,9 @@ from dotenv import load_dotenv
 load_dotenv()  # reads .env for Chalk credentials
 
 # resolve deployed agent by name — no URL, no client wiring
-investigate_refund_streaming = RemoteFunction.from_name("investigate_refund_streaming")
-agent = investigate_refund_streaming  # uniform handle for the UI's console trace link
+agent = RemoteFunction.from_name("investigate_refund_streaming")
 
 
 # call the agent — runs server-side in Chalk Compute, we yield chunks as they arrive
 def investigate(user_id: int, reason: str) -> Iterator[str]:
-    yield from investigate_refund_streaming.remote(user_id, reason)
+    yield from agent.remote(user_id, reason)
