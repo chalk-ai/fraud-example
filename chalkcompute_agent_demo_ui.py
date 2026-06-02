@@ -73,6 +73,14 @@ def _humanize_windows(text: str) -> str:
     return _WINDOW_RE.sub(lambda m: f" · {_window_label(m.group(1))}", text)
 
 
+# Render total_spend as currency: 48911.08000... -> $48,911.08
+_SPEND_RE = re.compile(r"(total_spend:\s*)(\d+(?:\.\d+)?)")
+
+
+def _format_spend(text: str) -> str:
+    return _SPEND_RE.sub(lambda m: f"{m.group(1)}${float(m.group(2)):,.2f}", text)
+
+
 def trace_block(raw: str) -> str:
     """The leading tool-call trace, i.e. everything before the verdict."""
     m = _VERDICT_RE.search(raw)
@@ -102,7 +110,7 @@ def parse_steps(raw: str) -> list[dict]:
             "tool": name,
             "label": _step_label(name, args),
             "args": _parse_args(args),
-            "result": _humanize_windows(result.strip()),
+            "result": _format_spend(_humanize_windows(result.strip())),
         })
     return steps
 
@@ -457,7 +465,7 @@ HTML = r"""<!DOCTYPE html>
 
   /* ── H nodes (hypothesis) — left/top set by JS ── */
   .tree-hyp {
-    width: 158px; min-height: 100px;
+    width: 264px; min-height: 100px;
     opacity: 0.4; transform: scale(.97);
   }
   .tree-hyp.active { opacity: 1; transform: scale(1); }
@@ -508,7 +516,7 @@ HTML = r"""<!DOCTYPE html>
     transition: stroke .4s, stroke-width .4s;
   }
   .tree-svg .edge-active  { stroke: var(--accent); stroke-width: 2; }
-  .tree-svg .edge-visited { stroke: var(--border-strong); stroke-width: 2; }
+  .tree-svg .edge-visited { stroke: var(--line); stroke-width: 1.5; }  /* same as the rails */
   .tree-svg .edge-done    { stroke: var(--green); stroke-width: 2; }
   .tree-svg .edge-alert   { stroke: var(--amber); stroke-width: 2; }
   .tree-svg .edge-deny    { stroke: var(--red);   stroke-width: 2; }
@@ -1113,7 +1121,7 @@ function esc(s) {
 
 // ── Tree helpers (dynamic, N nodes from the agent's plan) ──────────────────────
 
-const NODE_W = 158, NODE_GAP = 20, SRC_W = 300, SRC_H = 64, CONC_W = 320;
+const NODE_W = 264, NODE_GAP = 20, SRC_W = 300, SRC_H = 64, CONC_W = 320;
 const ROW_TOP = 118;   // top y of the hypothesis row
 const FAN_Y   = 90;    // y of the horizontal fan rail
 const PAD     = 10;    // bottom padding of the canvas
@@ -1310,7 +1318,7 @@ function renderTreeConclusion(verdict) {
   document.getElementById('tree-conc-label').innerHTML =
     `<span>${glyph}</span><span>${esc(verdict)}</span>`;
 
-  setEdge('e-conc', v === 'approve' ? 'edge-done' : v === 'deny' ? 'edge-deny' : 'edge-alert');
+  setEdge('e-conc', 'edge-visited');  // keep all connectors uniform gray; colour lives on the node
   drawEdges();
 }
 
