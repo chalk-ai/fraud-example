@@ -1284,7 +1284,7 @@ function updateTreeHyp(id, status, summary) {
   if (status === 'running') {
     node.classList.add('hyp-running');
     icon.textContent = '↻'; icon.className = 'hyp-icon spinning';
-    setEdge(`e-in-${id}`, 'edge-active');
+    setEdge(`e-in-${id}`, 'edge-visited');  // keep connectors gray even while running
   } else if (status === 'done') {
     // "done" = lookup completed, not "passed" — keep it neutral so green doesn't
     // imply a clean verdict. The verdict colour lives on the conclusion node only.
