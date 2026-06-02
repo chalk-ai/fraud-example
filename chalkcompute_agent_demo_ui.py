@@ -479,26 +479,13 @@ HTML = r"""<!DOCTYPE html>
     display: flex; flex-direction: column; gap: 2px;
     z-index: 100; animation: rise 0.15s ease;
   }
-  .dropdown-head {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 4px 12px 8px; margin-bottom: 2px; border-bottom: 1px solid var(--border);
-    font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--faint);
-  }
   .user-option {
     display: flex; flex-direction: column; align-items: stretch; gap: 5px;
     padding: 10px 12px; border-radius: 7px; cursor: pointer; transition: background 0.1s; user-select: none;
   }
   .user-option:hover { background: var(--surface2); }
-  .user-option-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .user-option-id { font-size: 13px; font-weight: 600; font-family: 'JetBrains Mono', 'SF Mono', 'Menlo', monospace; }
   .user-option-reason { font-size: 12.5px; color: var(--text2); }
-  .user-option-right { display: flex; align-items: center; gap: 7px; }
-  .risk-badge { font-size: 9.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 7px; border-radius: 4px; }
-  .risk-high   { background: var(--red-bg);   color: var(--red-text); }
-  .risk-low    { background: var(--green-bg); color: var(--green-text); }
-  .risk-medium { background: var(--amber-bg); color: var(--amber-text); }
-  .user-desc   { font-size: 11px; color: var(--muted); }
 
   /* ── Chat ── */
   .chat { flex: 1; overflow-y: auto; padding: 28px 24px; display: flex; flex-direction: column; gap: 22px; }
@@ -665,30 +652,17 @@ HTML = r"""<!DOCTYPE html>
             <span class="user-sel-chevron">▾</span>
           </button>
           <div class="user-dropdown" id="userDropdown" style="display:none">
-            <div class="dropdown-head">
-              <span>Refund claim</span>
-              <span>Account fraud risk</span>
+            <div class="user-option" onclick="selectUser(1, 'My order never arrived', '10482')">
+              <span class="user-option-id">#10482 · user_id=1</span>
+              <span class="user-option-reason">“My order never arrived”</span>
             </div>
-            <div class="user-option" onclick="selectUser(3, 'Item arrived damaged', '10482')">
-              <div class="user-option-top">
-                <span class="user-option-id">#10482 · user_id=3</span>
-                <span class="risk-badge risk-medium">Medium</span>
-              </div>
+            <div class="user-option" onclick="selectUser(2, 'Item arrived damaged', '10517')">
+              <span class="user-option-id">#10517 · user_id=2</span>
               <span class="user-option-reason">“Item arrived damaged”</span>
             </div>
-            <div class="user-option" onclick="selectUser(2, 'Package never arrived — my 4th non-delivery claim this month', '10517')">
-              <div class="user-option-top">
-                <span class="user-option-id">#10517 · user_id=2</span>
-                <span class="risk-badge risk-low">Low</span>
-              </div>
-              <span class="user-option-reason">“Package never arrived — my 4th non-delivery claim this month”</span>
-            </div>
-            <div class="user-option" onclick="selectUser(1, 'Several recent orders never arrived — refund them all to my new bank account', '10538')">
-              <div class="user-option-top">
-                <span class="user-option-id">#10538 · user_id=1</span>
-                <span class="risk-badge risk-high">High</span>
-              </div>
-              <span class="user-option-reason">“Several orders never arrived — refund all to a new bank account”</span>
+            <div class="user-option" onclick="selectUser(3, 'I received the wrong item', '10538')">
+              <span class="user-option-id">#10538 · user_id=3</span>
+              <span class="user-option-reason">“I received the wrong item”</span>
             </div>
           </div>
         </div>
