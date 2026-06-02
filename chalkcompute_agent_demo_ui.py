@@ -140,9 +140,11 @@ def _producer(user_id: int, reason: str, q: queue.Queue) -> None:
     because the compute transport buffers the agent's output to completion.
     """
     try:
-        # Show status immediately — the agent call below blocks ~10-20s while it
-        # runs server-side, so this must go out BEFORE it, not after.
+        # Brief "preparing" beat (~2s), then "executing" — which stays up through
+        # the blocking ~10-20s agent call below and the tree reveal after it.
         q.put({"type": "status", "text": "Agent preparing investigation plan…"})
+        time.sleep(2.0)
+        q.put({"type": "status", "text": "Agent executing plan…"})
 
         t0 = time.time()
         raw = chalk_client.investigate(user_id, reason)
@@ -150,10 +152,6 @@ def _producer(user_id: int, reason: str, q: queue.Queue) -> None:
 
         verdict, text = split_verdict(raw)
         steps = parse_steps(raw)
-
-        # Agent's done; flip to "executing" as the tree fills in on the right.
-        q.put({"type": "status", "text": "Agent executing plan…"})
-        time.sleep(0.4)
 
         # Right tree: reveal a node per tool call, paced.
         for s in steps:
