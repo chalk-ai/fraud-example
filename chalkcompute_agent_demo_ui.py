@@ -667,26 +667,26 @@ HTML = r"""<!DOCTYPE html>
             <span class="user-sel-chevron">▾</span>
           </button>
           <div class="user-dropdown" id="userDropdown" style="display:none">
-            <div class="user-option" onclick="selectUser(1, 'Item arrived damaged')">
+            <div class="user-option" onclick="selectUser(3, 'Item arrived damaged', '10482')">
               <div class="user-option-top">
-                <span class="user-option-id">user_id=1</span>
+                <span class="user-option-id">#10482 · user_id=3</span>
                 <span class="risk-badge risk-medium">Medium</span>
               </div>
               <span class="user-option-reason">“Item arrived damaged”</span>
             </div>
-            <div class="user-option" onclick="selectUser(2, 'Changed my mind')">
+            <div class="user-option" onclick="selectUser(2, 'Package never arrived — my 4th non-delivery claim this month', '10517')">
               <div class="user-option-top">
-                <span class="user-option-id">user_id=2</span>
+                <span class="user-option-id">#10517 · user_id=2</span>
                 <span class="risk-badge risk-low">Low</span>
               </div>
-              <span class="user-option-reason">“Changed my mind”</span>
+              <span class="user-option-reason">“Package never arrived — my 4th non-delivery claim this month”</span>
             </div>
-            <div class="user-option" onclick="selectUser(3, 'Package never arrived')">
+            <div class="user-option" onclick="selectUser(1, 'Several recent orders never arrived — refund them all to my new bank account', '10538')">
               <div class="user-option-top">
-                <span class="user-option-id">user_id=3</span>
+                <span class="user-option-id">#10538 · user_id=1</span>
                 <span class="risk-badge risk-high">High</span>
               </div>
-              <span class="user-option-reason">“Package never arrived”</span>
+              <span class="user-option-reason">“Several orders never arrived — refund all to a new bank account”</span>
             </div>
           </div>
         </div>
@@ -737,8 +737,10 @@ HTML = r"""<!DOCTYPE html>
 
 <script>
 let selectedUser   = null;
+let selectedOrder  = null;
 let currentUserId  = null;
 let currentReason  = null;
+let currentOrder   = null;
 let sessionId      = null;
 let mode           = 'idle';
 let activeAgentMsg = null;
@@ -763,11 +765,12 @@ function toggleDropdown() {
 
 // Pick one of the canned refund claims. The reason is mocked (not user-entered)
 // and shown read-only in the composer so it's visible before Investigate.
-function selectUser(id, reason) {
+function selectUser(id, reason, order) {
   selectedUser = id;
+  selectedOrder = order;
 
   const label = document.getElementById('userSelLabel');
-  label.textContent = `user_id=${id}`;
+  label.textContent = `#${order} · user_id=${id}`;
   document.getElementById('userSelBtn').className = `user-sel-btn`;
   document.getElementById('userDropdown').style.display = 'none';
 
@@ -818,6 +821,7 @@ function startInvestigation() {
 
   currentUserId = selectedUser;
   currentReason = reason;
+  currentOrder  = selectedOrder;
 
   // Swap from the fresh-start view to the split investigation view.
   document.getElementById('startView').style.display = 'none';
@@ -828,7 +832,7 @@ function startInvestigation() {
   showTreeHint('planning');
   setMode('thinking');
 
-  appendUserBubble(selectedUser, reason);
+  appendUserBubble(selectedUser, reason, selectedOrder);
   activeAgentMsg = appendAgentMsg();
   scrollBottom();
 
@@ -859,7 +863,7 @@ function sendReply() {
 function dismiss() {
   sessionId = null;
   activeAgentMsg = null; activeThinking = null;
-  currentUserId = null; currentReason = null;
+  currentUserId = null; currentReason = null; currentOrder = null;
 
   resetTree();
   document.getElementById('chat').innerHTML = '';
@@ -870,7 +874,7 @@ function dismiss() {
   document.getElementById('startView').style.display = 'flex';
 
   // Reset composer.
-  selectedUser = null;
+  selectedUser = null; selectedOrder = null;
   document.getElementById('userSelLabel').textContent = 'Select a claim';
   const si = document.getElementById('startInput');
   si.value = ''; si.placeholder = 'Refund reason appears here…';
@@ -984,10 +988,11 @@ function finalizeStatus(doneText) {
 
 // ── DOM helpers ───────────────────────────────────────────────────────────────
 
-function appendUserBubble(userId, reason) {
+function appendUserBubble(userId, reason, order) {
   const el = document.createElement('div');
   el.className = 'msg-user';
-  el.innerHTML = `<div class="msg-user-ref">user_id=${esc(userId)}</div><div class="msg-user-reason">${esc(reason)}</div>`;
+  el.innerHTML = `<div class="msg-user-ref">Order #${esc(order)} · user_id=${esc(userId)}</div>` +
+                 `<div class="msg-user-reason">${esc(reason)}</div>`;
   document.getElementById('chat').appendChild(el);
 }
 
@@ -1076,7 +1081,7 @@ function ensureTreeScaffold() {
   canvas.innerHTML =
       '<svg class="tree-svg" id="treeSvg" xmlns="http://www.w3.org/2000/svg"></svg>'
     + `<div class="tree-node" id="tree-source" style="top:0;width:${SRC_W}px;">`
-    +   `<div class="tree-node-label">Source · Refund Claim</div>`
+    +   `<div class="tree-node-label">Source · Order #${esc(currentOrder)}</div>`
     +   `<div class="tree-node-title"><span class="mono">user_id=${esc(currentUserId)}</span> · ${reason}</div>`
     + `</div>`
     + `<div class="tree-node" id="tree-conclusion" style="width:${CONC_W}px;">`
