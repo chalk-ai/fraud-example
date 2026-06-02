@@ -660,13 +660,13 @@ HTML = r"""<!DOCTYPE html>
               <span class="user-option-id">#10482 · user_id=1</span>
               <span class="user-option-reason">“My order never arrived”</span>
             </div>
-            <div class="user-option" onclick="selectUser(2, 'Item arrived damaged', '10517')">
+            <div class="user-option" onclick="selectUser(2, 'I received the wrong item', '10517')">
               <span class="user-option-id">#10517 · user_id=2</span>
-              <span class="user-option-reason">“Item arrived damaged”</span>
-            </div>
-            <div class="user-option" onclick="selectUser(3, 'I received the wrong item', '10538')">
-              <span class="user-option-id">#10538 · user_id=3</span>
               <span class="user-option-reason">“I received the wrong item”</span>
+            </div>
+            <div class="user-option" onclick="selectUser(9, 'Item arrived damaged', '10538')">
+              <span class="user-option-id">#10538 · user_id=9</span>
+              <span class="user-option-reason">“Item arrived damaged”</span>
             </div>
           </div>
         </div>
