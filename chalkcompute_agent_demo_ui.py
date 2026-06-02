@@ -667,19 +667,18 @@ HTML = r"""<!DOCTYPE html>
   /* ── Error ── */
   .error-card { background: var(--red-bg); border: 1px solid var(--red-bd); border-radius: 8px; padding: 10px 14px; font-size: 13px; color: var(--red-text); }
 
-  /* ── Pacing toggle (subtle, bottom-right) ── */
+  /* ── Mode toggle (tiny, bottom-right): "s" streaming · "b" batch ── */
   .pacing-toggle {
-    position: fixed; bottom: 14px; right: 16px; z-index: 200;
-    display: flex; align-items: center; gap: 6px;
-    background: var(--surface); border: 1px solid var(--border); color: var(--muted);
-    border-radius: 999px; padding: 6px 12px; font-size: 11px;
+    position: fixed; bottom: 12px; right: 14px; z-index: 200;
+    display: flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; padding: 0;
+    background: var(--surface); border: 1px solid var(--border); color: var(--faint);
+    border-radius: 50%; font-size: 11px; font-weight: 600;
     font-family: 'JetBrains Mono', 'SF Mono', 'Menlo', monospace;
-    cursor: pointer; box-shadow: var(--sh-s); opacity: 0.5; user-select: none;
+    cursor: pointer; opacity: 0.4; user-select: none;
     transition: opacity .15s, color .15s, border-color .15s;
   }
   .pacing-toggle:hover { opacity: 1; color: var(--text2); border-color: var(--border-strong); }
-  .pacing-toggle .pace-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
-  .pacing-toggle.off .pace-dot { background: var(--faint); }
 
   /* ── Input bar ── */
   .input-bar { padding: 14px 24px; border-top: 1px solid var(--border); display: flex; gap: 10px; flex-shrink: 0; align-items: center; background: var(--surface); }
@@ -792,10 +791,8 @@ HTML = r"""<!DOCTYPE html>
 
 </div><!-- /app-body -->
 
-<!-- Subtle toggle: simulated paced reveal vs. render-at-once -->
-<button id="pacingToggle" class="pacing-toggle" onclick="toggleClientMode()">
-  <span class="pace-dot"></span><span id="pacingLabel">paced reveal</span>
-</button>
+<!-- Tiny mode toggle: "s" = streaming (generator) · "b" = batch (chunked) -->
+<button id="pacingToggle" class="pacing-toggle" onclick="toggleClientMode()"><span id="pacingLabel">b</span></button>
 
 <script>
 let selectedUser   = null;
@@ -818,12 +815,10 @@ function toggleClientMode() {
   updateModeLabel();
 }
 function updateModeLabel() {
-  const btn = document.getElementById('pacingToggle');
-  document.getElementById('pacingLabel').textContent = useGenerator ? 'generator' : 'chunked';
-  btn.classList.toggle('off', !useGenerator);
-  btn.title = useGenerator
-    ? 'generator: investigate_refund_streaming (yields chunks) — click for chunked'
-    : 'chunked: investigate_refund (buffered text) — click for generator';
+  document.getElementById('pacingLabel').textContent = useGenerator ? 's' : 'b';
+  document.getElementById('pacingToggle').title = useGenerator
+    ? 'streaming — generator (investigate_refund_streaming); click for batch'
+    : 'batch — chunked (investigate_refund); click for streaming';
 }
 
 function traceLinkHtml(url) {
