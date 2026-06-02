@@ -54,8 +54,11 @@ def investigate(user_id: int, reason: str) -> str:
 _VERDICT_RE = re.compile(r"\b(APPROVE|DENY|ESCALATE)\b")
 
 # A trace line is `  name(args) → result`, where result may span multiple lines.
-# Match each call's result up to the next call's `name(` or end-of-trace.
-_STEP_RE = re.compile(r"^ {2}(\w+)\((.*?)\)\s*→\s*(.*?)(?=\n {2}\w+\(|\Z)",
+# Match each call's result up to the next call line or end-of-trace. Leading
+# spaces are 0–2: the agent indents every step two spaces, but lstrip()s the whole
+# blob, so the FIRST line loses its indent. Call lines are identified by the
+# `name(...) →` shape, so result lines (`user.total_spend: …`) never match.
+_STEP_RE = re.compile(r"^ {0,2}(\w+)\((.*?)\)\s*→\s*(.*?)(?=\n {0,2}\w+\(.*?\)\s*→|\Z)",
                       re.DOTALL | re.MULTILINE)
 # key=value pairs in an args string; values may be quoted/bracketed (and contain
 # commas), so match those before the bare-token case.
