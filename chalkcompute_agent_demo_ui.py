@@ -151,18 +151,46 @@ def trace_url(agent, start_s: float, end_s: float) -> str:
             f"/environments/{ENV_ID}/scaling-groups/{sg}?{qs}")
 
 
+def _collect_generator(user_id: int, reason: str,
+                       first_chunk_timeout: float = 20.0,
+                       overall_timeout: float = 180.0) -> str | None:
+    """Drain the streaming client to full text, or return None if it stalls.
+
+    The streaming fn can hang (yield nothing — Elliot's deploy is mid-build), so
+    run it on a worker thread and give up if no first chunk arrives in time. The
+    abandoned thread keeps polling in the background (daemon) but is harmless.
+    """
+    chunks: list[str] = []
+    first, done, err = threading.Event(), threading.Event(), {}
+
+    def run():
+        try:
+            for ch in chalk_client_generator.investigate(user_id, reason):
+                chunks.append(ch)
+                first.set()
+            done.set()
+        except Exception as e:
+            err["e"] = e
+            first.set(); done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    if not first.wait(first_chunk_timeout) or err:
+        return None
+    done.wait(overall_timeout)
+    return None if (err or not done.is_set()) else "".join(chunks)
+
+
 def _producer(user_id: int, reason: str, q: queue.Queue, mode: str = "chunked") -> None:
     """Call the agent, then narrate the investigation.
 
     `mode` selects which deployed function the toggle picked:
       - "chunked"   -> chalk_client_chunked   (investigate_refund, buffered string)
       - "generator" -> chalk_client_generator (investigate_refund_streaming, yields)
-    Either way we drain to the full "{trace}\n\n{verdict}" text the tree + verdict
-    parsing need. The tree reveal is staggered for "chunked" (the simulated look)
-    and rendered straight through for "generator". The "investigating" status
-    covers the real, opaque agent latency.
+    Generator can hang, so if it doesn't produce a first chunk in time we fall
+    back to the chunked agent and render that — the demo never freezes. Either
+    path drains to the full "{trace}\n\n{verdict}" text the tree + verdict parsing
+    need; the reveal is staggered for chunked, straight through for a live stream.
     """
-    client = chalk_client_generator if mode == "generator" else chalk_client_chunked
     paced = mode == "chunked"
 
     def beat(secs: float) -> None:
@@ -171,10 +199,22 @@ def _producer(user_id: int, reason: str, q: queue.Queue, mode: str = "chunked") 
 
     try:
         q.put({"type": "status", "text": "Agent investigating…"})
-
         t0 = time.time()
-        raw = "".join(client.investigate(user_id, reason))
-        url = trace_url(client.agent, t0, time.time())
+
+        if mode == "generator":
+            raw = _collect_generator(user_id, reason)
+            if raw is None:
+                q.put({"type": "status", "text": "Streaming agent didn't respond — falling back…"})
+                raw = chalk_client_chunked.investigate(user_id, reason)
+                agent = chalk_client_chunked.agent
+                paced = True  # render the fallback like a normal chunked run
+            else:
+                agent = chalk_client_generator.agent
+        else:
+            raw = chalk_client_chunked.investigate(user_id, reason)
+            agent = chalk_client_chunked.agent
+
+        url = trace_url(agent, t0, time.time())
 
         verdict, text = split_verdict(raw)
         steps = parse_steps(raw)
