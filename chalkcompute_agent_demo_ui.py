@@ -831,12 +831,11 @@ let mode           = 'idle';
 let activeAgentMsg = null;
 let activeThinking = null;
 let activeStatus   = null;
-let useGenerator   = localStorage.getItem('clientMode') === 'generator';  // default chunked
+let useGenerator   = true;  // default to streaming ("s"); reset to "s" each new investigation
 
 // ── Client toggle: chunked (investigate_refund) vs generator (…_streaming) ─────
 function toggleClientMode() {
   useGenerator = !useGenerator;
-  localStorage.setItem('clientMode', useGenerator ? 'generator' : 'chunked');
   updateModeLabel();
 }
 function updateModeLabel() {
@@ -970,6 +969,7 @@ function dismiss() {
   selectedUser = null; selectedReason = null; selectedOrder = null;
   document.getElementById('userSelLabel').textContent = 'Select a claim';
   document.getElementById('startBtn').disabled = true;
+  useGenerator = true; updateModeLabel();  // each new investigation starts on "s"
   mode = 'idle';
 }
 
@@ -1007,9 +1007,8 @@ function handleEvent(ev) {
     setStatus(ev.text);
 
   } else if (ev.type === 'mode') {
-    // server fell back (or switched) modes — reflect it on the toggle
+    // server fell back (or switched) modes — reflect it on the toggle (this run only)
     useGenerator = ev.value === 'generator';
-    localStorage.setItem('clientMode', useGenerator ? 'generator' : 'chunked');
     updateModeLabel();
 
   } else if (ev.type === 'tree_node') {
