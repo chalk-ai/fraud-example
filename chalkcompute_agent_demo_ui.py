@@ -408,7 +408,7 @@ HTML = r"""<!DOCTYPE html>
   .right-header .dotmark { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
   .right-body {
     flex: 1; overflow: auto; position: relative;
-    display: flex; align-items: flex-start; justify-content: center;
+    display: flex; align-items: flex-start; justify-content: safe center;
     padding: 56px 32px;
   }
 
