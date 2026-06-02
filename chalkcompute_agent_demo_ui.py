@@ -297,7 +297,8 @@ class ReplyRequest(BaseModel):
 
 @app.get("/")
 async def index() -> HTMLResponse:
-    return HTMLResponse(HTML)
+    # no-store so the browser never serves a stale page during iteration/demo
+    return HTMLResponse(HTML, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/investigate")
