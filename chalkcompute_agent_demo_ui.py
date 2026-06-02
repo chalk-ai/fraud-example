@@ -148,19 +148,24 @@ def trace_url(start_s: float, end_s: float) -> str:
             f"/environments/{ENV_ID}/scaling-groups/{sg}?{qs}")
 
 
-def _producer(user_id: int, reason: str, q: queue.Queue) -> None:
+def _producer(user_id: int, reason: str, q: queue.Queue, paced: bool = True) -> None:
     """Call the agent (chalk_client), then narrate the investigation.
 
     The left chat shows brief status — preparing, then executing — while the
     right-hand tree does the work: one node per tool call (spinning → done),
-    finishing with the verdict. We pace the server→browser emission ourselves
-    because the compute transport buffers the agent's output to completion.
+    finishing with the verdict. When `paced`, we stagger the server→browser
+    emission to read like a live investigation (the transport actually buffers
+    the agent's output to completion); when off, everything renders at once.
     """
+    def beat(secs: float) -> None:
+        if paced:
+            time.sleep(secs)
+
     try:
         # Brief "preparing" beat (~2s), then "executing" — which stays up through
         # the blocking ~10-20s agent call below and the tree reveal after it.
         q.put({"type": "status", "text": "Agent preparing investigation plan…"})
-        time.sleep(2.0)
+        beat(2.0)
         q.put({"type": "status", "text": "Agent executing plan…"})
 
         t0 = time.time()
@@ -173,12 +178,12 @@ def _producer(user_id: int, reason: str, q: queue.Queue) -> None:
         # Right tree: reveal a node per tool call, paced.
         for s in steps:
             q.put({"type": "tree_node", "id": s["id"], "label": s["label"], "tool": s["tool"]})
-            time.sleep(0.5)
+            beat(0.5)
             q.put({"type": "tree_node_done", "id": s["id"], "result": s["result"]})
-            time.sleep(0.35)
+            beat(0.35)
 
         if verdict:
-            time.sleep(0.2)
+            beat(0.2)
             q.put({"type": "decision", "verdict": verdict, "text": text, "trace_url": url})
         else:
             q.put({"type": "question", "text": text, "trace_url": url})
@@ -215,6 +220,7 @@ app = FastAPI()
 class InvestigateRequest(BaseModel):
     user_id: int
     reason: str
+    paced: bool = True
 
 
 class ReplyRequest(BaseModel):
@@ -230,7 +236,7 @@ async def index() -> HTMLResponse:
 async def investigate(req: InvestigateRequest) -> StreamingResponse:
     session_id = str(uuid.uuid4())
     q: queue.Queue = queue.Queue()
-    threading.Thread(target=_producer, args=(req.user_id, req.reason, q), daemon=True).start()
+    threading.Thread(target=_producer, args=(req.user_id, req.reason, q, req.paced), daemon=True).start()
 
     async def stream():
         yield f"data: {json.dumps({'type': 'session', 'id': session_id})}\n\n"
@@ -617,6 +623,20 @@ HTML = r"""<!DOCTYPE html>
   /* ── Error ── */
   .error-card { background: var(--red-bg); border: 1px solid var(--red-bd); border-radius: 8px; padding: 10px 14px; font-size: 13px; color: var(--red-text); }
 
+  /* ── Pacing toggle (subtle, bottom-right) ── */
+  .pacing-toggle {
+    position: fixed; bottom: 14px; right: 16px; z-index: 200;
+    display: flex; align-items: center; gap: 6px;
+    background: var(--surface); border: 1px solid var(--border); color: var(--muted);
+    border-radius: 999px; padding: 6px 12px; font-size: 11px;
+    font-family: 'JetBrains Mono', 'SF Mono', 'Menlo', monospace;
+    cursor: pointer; box-shadow: var(--sh-s); opacity: 0.5; user-select: none;
+    transition: opacity .15s, color .15s, border-color .15s;
+  }
+  .pacing-toggle:hover { opacity: 1; color: var(--text2); border-color: var(--border-strong); }
+  .pacing-toggle .pace-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+  .pacing-toggle.off .pace-dot { background: var(--faint); }
+
   /* ── Input bar ── */
   .input-bar { padding: 14px 24px; border-top: 1px solid var(--border); display: flex; gap: 10px; flex-shrink: 0; align-items: center; background: var(--surface); }
   .main-input { flex: 1; background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 11px 16px; color: var(--text); font-size: 14px; font-family: inherit; outline: none; transition: border-color 0.15s, box-shadow 0.15s; }
@@ -728,6 +748,11 @@ HTML = r"""<!DOCTYPE html>
 
 </div><!-- /app-body -->
 
+<!-- Subtle toggle: simulated paced reveal vs. render-at-once -->
+<button id="pacingToggle" class="pacing-toggle" onclick="togglePacing()">
+  <span class="pace-dot"></span><span id="pacingLabel">paced reveal</span>
+</button>
+
 <script>
 let selectedUser   = null;
 let selectedReason = null;
@@ -740,6 +765,22 @@ let mode           = 'idle';
 let activeAgentMsg = null;
 let activeThinking = null;
 let activeStatus   = null;
+let pacingOn       = localStorage.getItem('demoPacing') !== 'off';  // default on
+
+// ── Pacing toggle (simulated reveal beats on/off) ──────────────────────────────
+function togglePacing() {
+  pacingOn = !pacingOn;
+  localStorage.setItem('demoPacing', pacingOn ? 'on' : 'off');
+  updatePacingLabel();
+}
+function updatePacingLabel() {
+  const btn = document.getElementById('pacingToggle');
+  document.getElementById('pacingLabel').textContent = pacingOn ? 'paced reveal' : 'instant';
+  btn.classList.toggle('off', !pacingOn);
+  btn.title = pacingOn
+    ? 'Reveal is paced to read like a live investigation — click for instant'
+    : 'Renders all at once when the agent returns — click for paced reveal';
+}
 
 function traceLinkHtml(url) {
   if (!url) return '';
@@ -827,7 +868,7 @@ function startInvestigation() {
   fetch('/investigate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({user_id: selectedUser, reason}),
+    body: JSON.stringify({user_id: selectedUser, reason, paced: pacingOn}),
   }).then(res => streamEvents(res)).catch(() => setMode('done'));
 }
 
@@ -1219,6 +1260,9 @@ function resetTree() {
   canvas.innerHTML = ''; canvas.style.height = ''; canvas.style.width = '';
   showTreeHint('idle');
 }
+
+// Reflect the saved pacing preference on the toggle at load.
+updatePacingLabel();
 </script>
 </body>
 </html>"""
