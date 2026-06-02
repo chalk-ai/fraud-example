@@ -151,22 +151,21 @@ def trace_url(start_s: float, end_s: float) -> str:
 def _producer(user_id: int, reason: str, q: queue.Queue, paced: bool = True) -> None:
     """Call the agent (chalk_client), then narrate the investigation.
 
-    The left chat shows brief status — preparing, then executing — while the
-    right-hand tree does the work: one node per tool call (spinning → done),
-    finishing with the verdict. When `paced`, we stagger the server→browser
-    emission to read like a live investigation (the transport actually buffers
-    the agent's output to completion); when off, everything renders at once.
+    The agent call is one opaque blocking request, so the chat shows a single
+    honest "investigating" status for its (real) duration — no fabricated
+    planning/executing phases. The right-hand tree then reveals one node per tool
+    call. When `paced`, we stagger that reveal to read like a live investigation
+    (the transport actually buffers the agent's output to completion); when off,
+    it renders the moment the agent returns. The only simulated thing is the
+    stagger — the "investigating" status covers genuine latency.
     """
     def beat(secs: float) -> None:
         if paced:
             time.sleep(secs)
 
     try:
-        # Brief "preparing" beat (~2s), then "executing" — which stays up through
-        # the blocking ~10-20s agent call below and the tree reveal after it.
-        q.put({"type": "status", "text": "Agent preparing investigation plan…"})
-        beat(2.0)
-        q.put({"type": "status", "text": "Agent executing plan…"})
+        # One honest status covering the real, opaque ~10-20s agent call below.
+        q.put({"type": "status", "text": "Agent investigating…"})
 
         t0 = time.time()
         raw = chalk_client.investigate(user_id, reason)
