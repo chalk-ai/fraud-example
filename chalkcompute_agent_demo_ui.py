@@ -480,11 +480,13 @@ HTML = r"""<!DOCTYPE html>
     z-index: 100; animation: rise 0.15s ease;
   }
   .user-option {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 9px 12px; border-radius: 7px; cursor: pointer; transition: background 0.1s; user-select: none;
+    display: flex; flex-direction: column; align-items: stretch; gap: 5px;
+    padding: 10px 12px; border-radius: 7px; cursor: pointer; transition: background 0.1s; user-select: none;
   }
   .user-option:hover { background: var(--surface2); }
+  .user-option-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .user-option-id { font-size: 13px; font-weight: 600; font-family: 'JetBrains Mono', 'SF Mono', 'Menlo', monospace; }
+  .user-option-reason { font-size: 12.5px; color: var(--text2); }
   .user-option-right { display: flex; align-items: center; gap: 7px; }
   .risk-badge { font-size: 9.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 7px; border-radius: 4px; }
   .risk-high   { background: var(--red-bg);   color: var(--red-text); }
@@ -655,41 +657,41 @@ HTML = r"""<!DOCTYPE html>
   <div class="start-inner">
     <div class="start-mark">⬡</div>
     <div class="start-title">ACME Corp. Refund Investigator</div>
-    <div class="start-sub">Pick a user and describe their refund claim.</div>
+    <div class="start-sub">Pick a refund claim to investigate.</div>
 
     <div class="composer">
       <div class="composer-row">
         <div class="user-sel" id="userSel">
           <button class="user-sel-btn" id="userSelBtn" onclick="toggleDropdown()">
-            <span id="userSelLabel">Select user</span>
+            <span id="userSelLabel">Select a claim</span>
             <span class="user-sel-chevron">▾</span>
           </button>
           <div class="user-dropdown" id="userDropdown" style="display:none">
-            <div class="user-option" onclick="selectUser(1,'medium')">
-              <span class="user-option-id">user_id=1</span>
-              <div class="user-option-right">
+            <div class="user-option" onclick="selectUser(1, 'Item arrived damaged')">
+              <div class="user-option-top">
+                <span class="user-option-id">user_id=1</span>
                 <span class="risk-badge risk-medium">Medium</span>
-                <span class="user-desc">acct age 38d</span>
               </div>
+              <span class="user-option-reason">“Item arrived damaged”</span>
             </div>
-            <div class="user-option" onclick="selectUser(2,'low')">
-              <span class="user-option-id">user_id=2</span>
-              <div class="user-option-right">
+            <div class="user-option" onclick="selectUser(2, 'Changed my mind')">
+              <div class="user-option-top">
+                <span class="user-option-id">user_id=2</span>
                 <span class="risk-badge risk-low">Low</span>
-                <span class="user-desc">acct age 4y</span>
               </div>
+              <span class="user-option-reason">“Changed my mind”</span>
             </div>
-            <div class="user-option" onclick="selectUser(3,'high')">
-              <span class="user-option-id">user_id=3</span>
-              <div class="user-option-right">
-                <span class="risk-badge risk-high">New</span>
-                <span class="user-desc">acct age 22d</span>
+            <div class="user-option" onclick="selectUser(3, 'Package never arrived')">
+              <div class="user-option-top">
+                <span class="user-option-id">user_id=3</span>
+                <span class="risk-badge risk-high">High</span>
               </div>
+              <span class="user-option-reason">“Package never arrived”</span>
             </div>
           </div>
         </div>
         <input id="startInput" class="composer-input" type="text"
-               placeholder="Select a user first…"
+               placeholder="Refund reason appears here…"
                disabled
                onkeydown="if(event.key==='Enter')startInvestigation()">
       </div>
@@ -759,22 +761,21 @@ function toggleDropdown() {
   btn.classList.toggle('open', !open);
 }
 
-function selectUser(id, risk) {
+// Pick one of the canned refund claims. The reason is mocked (not user-entered)
+// and shown read-only in the composer so it's visible before Investigate.
+function selectUser(id, reason) {
   selectedUser = id;
 
-  const btn   = document.getElementById('userSelBtn');
   const label = document.getElementById('userSelLabel');
   label.textContent = `user_id=${id}`;
-  btn.className = `user-sel-btn`;
+  document.getElementById('userSelBtn').className = `user-sel-btn`;
   document.getElementById('userDropdown').style.display = 'none';
 
-  const input  = document.getElementById('startInput');
-  const start  = document.getElementById('startBtn');
-  input.disabled    = false;
-  input.placeholder = 'Describe the refund reason…';
-  input.value       = 'Item not as described';
-  start.disabled    = false;
-  input.focus(); input.select();
+  const input = document.getElementById('startInput');
+  input.value    = reason;
+  input.disabled = false;   // full opacity…
+  input.readOnly = true;    // …but not editable (the claim is pre-set)
+  document.getElementById('startBtn').disabled = false;
 }
 
 document.addEventListener('click', e => {
@@ -870,9 +871,10 @@ function dismiss() {
 
   // Reset composer.
   selectedUser = null;
-  document.getElementById('userSelLabel').textContent = 'Select user';
+  document.getElementById('userSelLabel').textContent = 'Select a claim';
   const si = document.getElementById('startInput');
-  si.value = ''; si.placeholder = 'Select a user first…'; si.disabled = true;
+  si.value = ''; si.placeholder = 'Refund reason appears here…';
+  si.disabled = true; si.readOnly = false;
   document.getElementById('startBtn').disabled = true;
   mode = 'idle';
 }
