@@ -191,8 +191,8 @@ def _race_modes(user_id: int, reason: str, q: queue.Queue,
         if not s_err and s_done.is_set():
             return "".join(stream_chunks), chalk_client_generator.agent, False
 
-    # else use the chunked result (already in flight since submit)
-    q.put({"type": "status", "text": "Streaming agent didn't respond — falling back…"})
+    # else use the chunked result (already in flight since submit) — silently;
+    # the only signal is the toggle quietly flipping s -> b via the `mode` event.
     q.put({"type": "mode", "value": "chunked"})
     c_done.wait(overall_timeout)
     if c_err or "raw" not in c_box:
