@@ -7,9 +7,11 @@
 
 This file is pure UI plumbing: a FastAPI server, an SSE event stream, and the
 HTML/CSS/JS for the chat + investigation tree. The actual Chalk Compute
-integration — resolving `investigate_refund`, calling it, and parsing its reply —
-lives in `chalk_client.py`. `_producer` is the bridge: it calls
-`chalk_client.investigate(...)` and turns the reply into UI events.
+integration lives in two interchangeable client modules — chalk_client_chunked
+(buffered `investigate_refund`) and chalk_client_generator (streaming
+`investigate_refund_streaming`). The UI's "chunked"/"generator" toggle picks
+which one; `_producer` is the bridge that calls it and turns the reply into UI
+events.
 
 Run:
   ./chalkcompute_agent_demo_ui.py 8123
@@ -30,11 +32,12 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
-import chalk_client  # the Chalk Compute integration: resolve + call the agent
+import chalk_client_chunked    # buffered investigate_refund (returns full text)
+import chalk_client_generator  # streaming investigate_refund_streaming (yields chunks)
 
 
 # ── Reading the agent's text response ────────────────────────────────────────
-# chalk_client.investigate() returns the agent's flat "{trace}\n\n{verdict}" text.
+# The client modules return the agent's flat "{trace}\n\n{verdict}" text.
 # The rest is app logic: pull it apart into a verdict and the tool calls.
 
 # The verdict keyword. Feature values in the trace never contain these words, so
@@ -134,9 +137,9 @@ ENV_ID = os.environ.get("CHALK_ENVIRONMENT_ID", "clk8fc4d2e1")
 _SG_FALLBACK = "investigate-refund"
 
 
-def trace_url(start_s: float, end_s: float) -> str:
-    """Console flame-graph trace view for the agent, windowed ±5min around the call."""
-    vi = getattr(chalk_client.investigate_refund, "version_info", None)
+def trace_url(agent, start_s: float, end_s: float) -> str:
+    """Console flame-graph trace view for `agent`, windowed ±5min around the call."""
+    vi = getattr(agent, "version_info", None)
     sg = (getattr(vi, "scaling_group_name", "") if vi else "") or _SG_FALLBACK
     qs = urlencode({
         "v": "remote-call-traces",
@@ -148,31 +151,30 @@ def trace_url(start_s: float, end_s: float) -> str:
             f"/environments/{ENV_ID}/scaling-groups/{sg}?{qs}")
 
 
-def _producer(user_id: int, reason: str, q: queue.Queue, paced: bool = True) -> None:
-    """Call the agent (chalk_client), then narrate the investigation.
+def _producer(user_id: int, reason: str, q: queue.Queue, mode: str = "chunked") -> None:
+    """Call the agent, then narrate the investigation.
 
-    The agent call is one opaque blocking request, so the chat shows a single
-    honest "investigating" status for its (real) duration — no fabricated
-    planning/executing phases. The right-hand tree then reveals one node per tool
-    call. When `paced`, we stagger that reveal to read like a live investigation
-    (the transport actually buffers the agent's output to completion); when off,
-    it renders the moment the agent returns. The only simulated thing is the
-    stagger — the "investigating" status covers genuine latency.
+    `mode` selects which deployed function the toggle picked:
+      - "chunked"   -> chalk_client_chunked   (investigate_refund, buffered string)
+      - "generator" -> chalk_client_generator (investigate_refund_streaming, yields)
+    Either way we drain to the full "{trace}\n\n{verdict}" text the tree + verdict
+    parsing need. The tree reveal is staggered for "chunked" (the simulated look)
+    and rendered straight through for "generator". The "investigating" status
+    covers the real, opaque agent latency.
     """
+    client = chalk_client_generator if mode == "generator" else chalk_client_chunked
+    paced = mode == "chunked"
+
     def beat(secs: float) -> None:
         if paced:
             time.sleep(secs)
 
     try:
-        # One honest status covering the real, opaque ~10-20s agent call below.
         q.put({"type": "status", "text": "Agent investigating…"})
 
         t0 = time.time()
-        # investigate() yields chunks; drain to the full "{trace}\n\n{verdict}"
-        # text the tree + verdict parsing need. (Joining is why this isn't live —
-        # the tree is built from the complete trace, not streamed token by token.)
-        raw = "".join(chalk_client.investigate(user_id, reason))
-        url = trace_url(t0, time.time())
+        raw = "".join(client.investigate(user_id, reason))
+        url = trace_url(client.agent, t0, time.time())
 
         verdict, text = split_verdict(raw)
         steps = parse_steps(raw)
@@ -222,7 +224,7 @@ app = FastAPI()
 class InvestigateRequest(BaseModel):
     user_id: int
     reason: str
-    paced: bool = True
+    mode: str = "chunked"   # "chunked" | "generator" (which deployed fn to call)
 
 
 class ReplyRequest(BaseModel):
@@ -238,7 +240,7 @@ async def index() -> HTMLResponse:
 async def investigate(req: InvestigateRequest) -> StreamingResponse:
     session_id = str(uuid.uuid4())
     q: queue.Queue = queue.Queue()
-    threading.Thread(target=_producer, args=(req.user_id, req.reason, q, req.paced), daemon=True).start()
+    threading.Thread(target=_producer, args=(req.user_id, req.reason, q, req.mode), daemon=True).start()
 
     async def stream():
         yield f"data: {json.dumps({'type': 'session', 'id': session_id})}\n\n"
@@ -751,7 +753,7 @@ HTML = r"""<!DOCTYPE html>
 </div><!-- /app-body -->
 
 <!-- Subtle toggle: simulated paced reveal vs. render-at-once -->
-<button id="pacingToggle" class="pacing-toggle" onclick="togglePacing()">
+<button id="pacingToggle" class="pacing-toggle" onclick="toggleClientMode()">
   <span class="pace-dot"></span><span id="pacingLabel">paced reveal</span>
 </button>
 
@@ -767,21 +769,21 @@ let mode           = 'idle';
 let activeAgentMsg = null;
 let activeThinking = null;
 let activeStatus   = null;
-let pacingOn       = localStorage.getItem('demoPacing') !== 'off';  // default on
+let useGenerator   = localStorage.getItem('clientMode') === 'generator';  // default chunked
 
-// ── Pacing toggle (simulated reveal beats on/off) ──────────────────────────────
-function togglePacing() {
-  pacingOn = !pacingOn;
-  localStorage.setItem('demoPacing', pacingOn ? 'on' : 'off');
-  updatePacingLabel();
+// ── Client toggle: chunked (investigate_refund) vs generator (…_streaming) ─────
+function toggleClientMode() {
+  useGenerator = !useGenerator;
+  localStorage.setItem('clientMode', useGenerator ? 'generator' : 'chunked');
+  updateModeLabel();
 }
-function updatePacingLabel() {
+function updateModeLabel() {
   const btn = document.getElementById('pacingToggle');
-  document.getElementById('pacingLabel').textContent = pacingOn ? 'chunked' : 'iteratable';
-  btn.classList.toggle('off', !pacingOn);
-  btn.title = pacingOn
-    ? 'Chunked: staggered reveal — click to switch to iteratable'
-    : 'Iteratable: stream as the agent yields — click to switch to chunked';
+  document.getElementById('pacingLabel').textContent = useGenerator ? 'generator' : 'chunked';
+  btn.classList.toggle('off', !useGenerator);
+  btn.title = useGenerator
+    ? 'generator: investigate_refund_streaming (yields chunks) — click for chunked'
+    : 'chunked: investigate_refund (buffered text) — click for generator';
 }
 
 function traceLinkHtml(url) {
@@ -870,7 +872,7 @@ function startInvestigation() {
   fetch('/investigate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({user_id: selectedUser, reason, paced: pacingOn}),
+    body: JSON.stringify({user_id: selectedUser, reason, mode: useGenerator ? 'generator' : 'chunked'}),
   }).then(res => streamEvents(res)).catch(() => setMode('done'));
 }
 
@@ -1263,8 +1265,8 @@ function resetTree() {
   showTreeHint('idle');
 }
 
-// Reflect the saved pacing preference on the toggle at load.
-updatePacingLabel();
+// Reflect the saved client-mode preference on the toggle at load.
+updateModeLabel();
 </script>
 </body>
 </html>"""
