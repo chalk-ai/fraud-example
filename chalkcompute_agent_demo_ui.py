@@ -268,6 +268,7 @@ HTML = r"""<!DOCTYPE html>
     --green:       #16a34a;  --green-text:#166534; --green-bg:#dcfce7; --green-bd:#86efac;
     --red:         #e01c40;  --red-text:#991b1b;   --red-bg:#fee2e2;   --red-bd:#fca5a5;
     --amber:       #b45309;  --amber-text:#b45309; --amber-bg:#fef3c7; --amber-bd:#fcd34d;
+    --blue:        #2563eb;  --blue-text:#1e40af;  --blue-bg:#e8f1fd;  --blue-bd:#bcd7f5;
     --tool-bg:     #f3f8f5;
     --tool-border: #d3e7db;
     /* Elevation (CDS) */
@@ -363,12 +364,12 @@ HTML = r"""<!DOCTYPE html>
     white-space: pre-line;   /* keep each feature on its own line */
   }
 
-  /* ── SOURCE node (position + size set by JS) ── */
+  /* ── SOURCE node (position + size set by JS) — the claim, neutral/informational ── */
   #tree-source {
-    background: var(--red-bg); border-color: var(--red-bd);
+    background: var(--blue-bg); border-color: var(--blue-bd);
   }
-  #tree-source .tree-node-label { color: #b3505f; }
-  #tree-source .tree-node-title { color: var(--red-text); font-size: 13px; }
+  #tree-source .tree-node-label { color: var(--blue); }
+  #tree-source .tree-node-title { color: var(--blue-text); font-size: 13px; }
   #tree-source .tree-node-title .mono { font-size: 12px; }
 
   /* ── H nodes (hypothesis) — left/top set by JS ── */
