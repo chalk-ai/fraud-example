@@ -921,7 +921,7 @@ function handleEvent(ev) {
     updateTreeHyp(ev.id, 'done', ev.result || '');
 
   } else if (ev.type === 'question') {
-    finalizeStatus();
+    finalizeStatus('Investigation complete');
     const bubble = document.createElement('div');
     bubble.className = 'msg-question'; bubble.textContent = ev.text;
     activeAgentMsg.appendChild(bubble);
@@ -929,7 +929,7 @@ function handleEvent(ev) {
     setMode('reply');
 
   } else if (ev.type === 'decision') {
-    finalizeStatus();
+    finalizeStatus('Investigation complete');
     const v = ev.verdict.toLowerCase();
 
     const card = document.createElement('div');
@@ -970,9 +970,16 @@ function setStatus(text) {
   activeStatus.querySelector('.status-text').textContent = text;
 }
 
-function finalizeStatus() {
+// Settle the status line instead of removing it: stop the dots, leave it in place
+// (optionally with a final label) so the trail of what the agent did stays visible.
+function finalizeStatus(doneText) {
   if (activeThinking) { activeThinking.remove(); activeThinking = null; }
-  if (activeStatus) { activeStatus.remove(); activeStatus = null; }
+  if (activeStatus) {
+    const dots = activeStatus.querySelector('.thinking');
+    if (dots) dots.remove();
+    if (doneText) activeStatus.querySelector('.status-text').textContent = doneText;
+    activeStatus = null;  // keep the element; just stop tracking it
+  }
 }
 
 // ── DOM helpers ───────────────────────────────────────────────────────────────
