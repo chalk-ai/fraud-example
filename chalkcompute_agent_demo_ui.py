@@ -52,6 +52,23 @@ _STEP_RE = re.compile(r"^ {0,2}(\w+)\((.*?)\)\s*→\s*(.*?)(?=\n {0,2}\w+\(.*?\)
 # commas), so match those before the bare-token case.
 _ARG_RE = re.compile(r"(\w+)=('[^']*'|\"[^\"]*\"|\[[^\]]*\]|[^,]+)")
 
+# Chalk windowed features come back as `name__<seconds>__` (e.g.
+# count_withdrawals__2592000__). Humanize the window into a readable unit so the
+# tree shows `count_withdrawals · 30d` instead of the raw second count.
+_WINDOW_RE = re.compile(r"__(\d+)__")
+
+
+def _window_label(seconds: str) -> str:
+    s = int(seconds)
+    for unit, suffix in ((31536000, "y"), (86400, "d"), (3600, "h"), (60, "m")):
+        if s % unit == 0:
+            return f"{s // unit}{suffix}"
+    return f"{s}s"
+
+
+def _humanize_windows(text: str) -> str:
+    return _WINDOW_RE.sub(lambda m: f" · {_window_label(m.group(1))}", text)
+
 
 def trace_block(raw: str) -> str:
     """The leading tool-call trace, i.e. everything before the verdict."""
@@ -82,7 +99,7 @@ def parse_steps(raw: str) -> list[dict]:
             "tool": name,
             "label": _step_label(name, args),
             "args": _parse_args(args),
-            "result": result.strip(),
+            "result": _humanize_windows(result.strip()),
         })
     return steps
 
