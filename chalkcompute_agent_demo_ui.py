@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12,<3.14"
-# dependencies = ["fastapi", "uvicorn[standard]", "python-dotenv", "chalkcompute>=2.1.0"]
+# dependencies = ["fastapi", "uvicorn[standard]", "python-dotenv", "chalkcompute>=2.1.1"]
 # ///
 """Refund-abuse agent demo UI.
 
