@@ -46,12 +46,9 @@ def _producer(user_id: int, reason: str, q: queue.Queue) -> None:
     """
     try:
         t0 = time.time()
-        raw = chalk_client.investigate(user_id, reason)
+        raw, verdict, text, steps = chalk_client.investigate(user_id, reason)
         url = chalk_client.trace_url(t0, time.time())
-
-        verdict, text = chalk_client.split_verdict(raw)
         trace = chalk_client.trace_block(raw)
-        steps = chalk_client.parse_steps(raw)
 
         pos = 0
         for s in steps:

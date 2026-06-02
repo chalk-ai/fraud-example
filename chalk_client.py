@@ -1,50 +1,35 @@
 """The entire Chalk Compute integration for the refund-abuse demo.
 
-Three things happen here, and nothing else:
-  1. Resolve Elliot's deployed agent by name        -> get_agent()
-  2. Call it over the wire and get its text back     -> investigate()
-  3. Read that text into a verdict + the tool calls  -> split_verdict() / parse_steps()
-
-The agent (`investigate_refund`) runs its whole agentic loop *inside Chalk
-Compute* — discovering and querying features on its own, secrets injected by
-Chalk, data never leaving the VPC. From here it's one function call.
+The whole story is the top of this file: resolve the deployed agent by name, call
+it, and read the text it returns. The agent (`investigate_refund`) runs its whole
+agentic loop *inside Chalk Compute* — discovering and querying features on its
+own, secrets injected by Chalk, data never leaving the VPC. From here it's one
+function call. Everything below `investigate()` is just parsing that text.
 """
 
 import os
 import re
-import time
 from urllib.parse import urlencode
 
 from chalkcompute import RemoteFunction
 from dotenv import load_dotenv
 
-# RemoteFunction.from_name authenticates with CHALK_* creds from the environment.
-load_dotenv()
-
-REMOTE_FN_NAME = "investigate_refund"
-
-_agent = None
+load_dotenv()  # CHALK_* creds for the from_name lookup below
 
 
-def get_agent() -> RemoteFunction:
-    """Resolve a handle to the deployed agent by name (no URL, no client setup)."""
-    global _agent
-    if _agent is None:
-        _agent = RemoteFunction.from_name(REMOTE_FN_NAME)
-    return _agent
+# resolve deployed agent by name — no URL, no client wiring
+investigate_refund = RemoteFunction.from_name("investigate_refund")
 
 
-def investigate(user_id: int, reason: str) -> str:
-    """Call the deployed agent and return its full response text.
+def investigate(user_id: int, reason: str):
+    # call the agent — runs server-side in Chalk Compute, we get text back
+    agent_response = "".join(investigate_refund.remote(user_id, reason))   # -> "{trace}\n\n{verdict}"
 
-    `.remote(...)` is the wire/RPC call (chalk-sandbox-sdk#180 split bare `fn(...)`
-    off to run locally). It returns `"{trace}\n\n{verdict}"` — a list of the
-    `get_chalk_features(...)` tool calls the agent made, then APPROVE/DENY/ESCALATE
-    plus one line of reasoning.
-    """
-    fn = get_agent()
-    call = getattr(fn, "remote", None) or fn
-    return _collect_text(call(user_id, reason))
+    # we drive the UI from that text
+    verdict, reasoning = split_verdict(agent_response)   # APPROVE / DENY / ESCALATE + one line
+    steps              = parse_steps(agent_response)      # the agent's feature queries / tool calls
+
+    return agent_response, verdict, reasoning, steps
 
 
 # ── Reading the agent's text response ────────────────────────────────────────
@@ -54,10 +39,10 @@ def investigate(user_id: int, reason: str) -> str:
 _VERDICT_RE = re.compile(r"\b(APPROVE|DENY|ESCALATE)\b")
 
 # A trace line is `  name(args) → result`, where result may span multiple lines.
-# Match each call's result up to the next call line or end-of-trace. Leading
-# spaces are 0–2: the agent indents every step two spaces, but lstrip()s the whole
-# blob, so the FIRST line loses its indent. Call lines are identified by the
-# `name(...) →` shape, so result lines (`user.total_spend: …`) never match.
+# Leading spaces are 0–2: the agent indents every step two spaces but lstrip()s
+# the whole blob, so the FIRST line loses its indent. Call lines are identified by
+# the `name(...) →` shape, so flush-left result lines (`user.total_spend: …`) never
+# match. Match each call's result up to the next call line or end-of-trace.
 _STEP_RE = re.compile(r"^ {0,2}(\w+)\((.*?)\)\s*→\s*(.*?)(?=\n {0,2}\w+\(.*?\)\s*→|\Z)",
                       re.DOTALL | re.MULTILINE)
 # key=value pairs in an args string; values may be quoted/bracketed (and contain
@@ -124,29 +109,6 @@ def _step_label(name: str, args: str) -> str:
     return name.replace("_", " ")
 
 
-def _collect_text(result) -> str:
-    """Drain the remote call into one string.
-
-    `.remote(...)` returns a scalar string or an iterator of text deltas. NB: the
-    compute transport currently buffers a generator's output and delivers every
-    yield at once on completion, so iterating here is not incremental.
-    """
-    if isinstance(result, (str, bytes, bytearray)):
-        return _coerce_text(result)
-    return "".join(_coerce_text(item) for item in result)
-
-
-def _coerce_text(item) -> str:
-    if isinstance(item, (bytes, bytearray)):
-        return item.decode()
-    if isinstance(item, str):
-        return item
-    if hasattr(item, "to_pydict"):  # defensively unwrap an Arrow batch
-        vals = item.to_pydict().get("result") or []
-        return "".join(v if isinstance(v, str) else str(v) for v in vals)
-    return str(item)
-
-
 # ── Console trace link (every call is traced server-side) ────────────────────
 # We can't mint the per-span deep link client-side (operator/span ids are
 # server-assigned), but we can deep-link to the scaling group's flame-graph view
@@ -160,7 +122,7 @@ _SG_FALLBACK = "investigate-refund"
 
 def trace_url(start_s: float, end_s: float) -> str:
     """Console flame-graph trace view for the agent, windowed ±5min around the call."""
-    vi = getattr(get_agent(), "version_info", None)
+    vi = getattr(investigate_refund, "version_info", None)
     sg = (getattr(vi, "scaling_group_name", "") if vi else "") or _SG_FALLBACK
     qs = urlencode({
         "v": "remote-call-traces",
