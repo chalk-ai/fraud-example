@@ -152,7 +152,7 @@ def trace_url(agent, start_s: float, end_s: float) -> str:
 
 
 def _collect_generator(user_id: int, reason: str,
-                       first_chunk_timeout: float = 20.0,
+                       first_chunk_timeout: float = 8.0,
                        overall_timeout: float = 180.0) -> str | None:
     """Drain the streaming client to full text, or return None if it stalls.
 
@@ -205,6 +205,7 @@ def _producer(user_id: int, reason: str, q: queue.Queue, mode: str = "chunked") 
             raw = _collect_generator(user_id, reason)
             if raw is None:
                 q.put({"type": "status", "text": "Streaming agent didn't respond — falling back…"})
+                q.put({"type": "mode", "value": "chunked"})  # flip the UI toggle to "b"
                 raw = chalk_client_chunked.investigate(user_id, reason)
                 agent = chalk_client_chunked.agent
                 paced = True  # render the fallback like a normal chunked run
@@ -980,6 +981,12 @@ function handleEvent(ev) {
 
   } else if (ev.type === 'status') {
     setStatus(ev.text);
+
+  } else if (ev.type === 'mode') {
+    // server fell back (or switched) modes — reflect it on the toggle
+    useGenerator = ev.value === 'generator';
+    localStorage.setItem('clientMode', useGenerator ? 'generator' : 'chunked');
+    updateModeLabel();
 
   } else if (ev.type === 'tree_node') {
     ensureTreeScaffold();
