@@ -151,33 +151,53 @@ def trace_url(agent, start_s: float, end_s: float) -> str:
             f"/environments/{ENV_ID}/scaling-groups/{sg}?{qs}")
 
 
-def _collect_generator(user_id: int, reason: str,
-                       first_chunk_timeout: float = 8.0,
-                       overall_timeout: float = 180.0) -> str | None:
-    """Drain the streaming client to full text, or return None if it stalls.
+def _race_modes(user_id: int, reason: str, q: queue.Queue,
+                first_chunk_timeout: float = 8.0,
+                overall_timeout: float = 180.0):
+    """Fire the streaming and chunked agents at once; pick whichever serves.
 
-    The streaming fn can hang (yield nothing — Elliot's deploy is mid-build), so
-    run it on a worker thread and give up if no first chunk arrives in time. The
-    abandoned thread keeps polling in the background (daemon) but is harmless.
+    Use the streaming result if it produces a first chunk within the timeout;
+    otherwise fall back to the chunked result, which has been running in parallel
+    the whole time (so the fallback isn't a fresh wait). Returns
+    (raw_text, agent_handle, fell_back). Emits the fallback status + a `mode`
+    event at the decision point so the UI flips the toggle to "b".
     """
-    chunks: list[str] = []
-    first, done, err = threading.Event(), threading.Event(), {}
+    stream_chunks: list[str] = []
+    s_first, s_done, s_err = threading.Event(), threading.Event(), {}
+    c_box, c_done, c_err = {}, threading.Event(), {}
 
-    def run():
+    def run_stream():
         try:
             for ch in chalk_client_generator.investigate(user_id, reason):
-                chunks.append(ch)
-                first.set()
-            done.set()
+                stream_chunks.append(ch); s_first.set()
+            s_done.set()
         except Exception as e:
-            err["e"] = e
-            first.set(); done.set()
+            s_err["e"] = e; s_first.set(); s_done.set()
 
-    threading.Thread(target=run, daemon=True).start()
-    if not first.wait(first_chunk_timeout) or err:
-        return None
-    done.wait(overall_timeout)
-    return None if (err or not done.is_set()) else "".join(chunks)
+    def run_chunked():
+        try:
+            c_box["raw"] = chalk_client_chunked.investigate(user_id, reason)
+        except Exception as e:
+            c_err["e"] = e
+        finally:
+            c_done.set()
+
+    threading.Thread(target=run_stream, daemon=True).start()
+    threading.Thread(target=run_chunked, daemon=True).start()
+
+    # streaming wins if it emits a real first chunk before the timeout
+    if s_first.wait(first_chunk_timeout) and not s_err:
+        s_done.wait(overall_timeout)
+        if not s_err and s_done.is_set():
+            return "".join(stream_chunks), chalk_client_generator.agent, False
+
+    # else use the chunked result (already in flight since submit)
+    q.put({"type": "status", "text": "Streaming agent didn't respond — falling back…"})
+    q.put({"type": "mode", "value": "chunked"})
+    c_done.wait(overall_timeout)
+    if c_err or "raw" not in c_box:
+        raise c_err.get("e", RuntimeError("chunked fallback failed"))
+    return c_box["raw"], chalk_client_chunked.agent, True
 
 
 def _producer(user_id: int, reason: str, q: queue.Queue, mode: str = "chunked") -> None:
@@ -186,10 +206,11 @@ def _producer(user_id: int, reason: str, q: queue.Queue, mode: str = "chunked") 
     `mode` selects which deployed function the toggle picked:
       - "chunked"   -> chalk_client_chunked   (investigate_refund, buffered string)
       - "generator" -> chalk_client_generator (investigate_refund_streaming, yields)
-    Generator can hang, so if it doesn't produce a first chunk in time we fall
-    back to the chunked agent and render that — the demo never freezes. Either
-    path drains to the full "{trace}\n\n{verdict}" text the tree + verdict parsing
-    need; the reveal is staggered for chunked, straight through for a live stream.
+    Generator can hang, so generator mode races both agents at once (_race_modes):
+    streaming wins if its first chunk beats 8s, else we use the chunked result
+    that was running in parallel — the demo never freezes. Either path drains to
+    the full "{trace}\n\n{verdict}" text; the reveal is staggered for chunked,
+    straight through for a live stream.
     """
     paced = mode == "chunked"
 
@@ -202,15 +223,9 @@ def _producer(user_id: int, reason: str, q: queue.Queue, mode: str = "chunked") 
         t0 = time.time()
 
         if mode == "generator":
-            raw = _collect_generator(user_id, reason)
-            if raw is None:
-                q.put({"type": "status", "text": "Streaming agent didn't respond — falling back…"})
-                q.put({"type": "mode", "value": "chunked"})  # flip the UI toggle to "b"
-                raw = chalk_client_chunked.investigate(user_id, reason)
-                agent = chalk_client_chunked.agent
-                paced = True  # render the fallback like a normal chunked run
-            else:
-                agent = chalk_client_generator.agent
+            raw, agent, fell_back = _race_modes(user_id, reason, q)
+            if fell_back:
+                paced = True  # render the chunked fallback like a normal chunked run
         else:
             raw = chalk_client_chunked.investigate(user_id, reason)
             agent = chalk_client_chunked.agent
