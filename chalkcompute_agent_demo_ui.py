@@ -1,27 +1,23 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12,<3.14"
-# dependencies = ["fastapi", "uvicorn[standard]", "openai", "chalkpy", "python-dotenv", "chalkcompute>=1.5.17"]
+# dependencies = ["fastapi", "uvicorn[standard]", "python-dotenv", "chalkcompute>=2.1.0"]
 # ///
-"""Refund-abuse agent demo UI — investigation plan edition.
+"""Refund-abuse agent demo UI.
 
-Agent discovers that an individually clean refund claim is part of a broader
-suspicious spike, builds an investigation plan, executes it step by step, and
-ESCALATEs.
+Thin web front end over the deployed `investigate_refund` Chalk Compute function.
+We resolve it by name (RemoteFunction.from_name), call it with a user_id + refund
+reason, and surface its APPROVE/DENY/ESCALATE verdict in chat.
 
-The agent loop itself lives in chalkcompute_agent_core.py and runs on Chalk
-Compute (so it shows up in Chalk's function tracing). This file is just the web
-UI: it builds the message history, invokes the deployed `investigate` function
-(which runs the whole loop and returns all UI events as a JSON array), and
-replays those events to the browser as SSE with light pacing so the run still
-looks live. (chalkcompute 2.0.0's generator-streaming call path doesn't deliver
-chunks back, so we run to completion and replay rather than true-stream.)
+The interesting part is what you DON'T see here: investigate_refund runs an
+agentic loop inside Chalk Compute, discovering and querying features on its own.
+Server-side tracing is on by default, so every call produces a flame graph in
+the Chalk console — the chat response links straight to it.
 
-  AGENT_REMOTE=1 (default)  → run the loop on Chalk Compute (auto-deploys on
-                              import; pre-deploy with ./chalkcompute_agent_core.py deploy)
-  AGENT_REMOTE=0            → run the loop in-process (no deploy needed; handy
-                              for local UI iteration). Nothing is traced.
-  AGENT_REPLAY_DELAY=0.45   → seconds between replayed events in remote mode.
+Config (env, all optional):
+  CHALK_CONSOLE_BASE     console origin for the trace link (default https://chalk.ai)
+  CHALK_CONSOLE_PROJECT  project id for the trace link
+  CHALK_ENVIRONMENT_ID   environment id for the trace link
 
 Run:
   ./chalkcompute_agent_demo_ui.py 8123
@@ -32,72 +28,242 @@ import asyncio
 import json
 import os
 import queue
-import random
+import re
 import sys
 import threading
+import time
 import uuid
-from fastapi import FastAPI, HTTPException
+from urllib.parse import urlencode
+from dotenv import load_dotenv
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
-import time
+# RemoteFunction.from_name authenticates with CHALK_* creds from the environment.
+load_dotenv()
 
-from chalkcompute_agent_core import (
-    SYSTEM_PROMPT,
-    investigate as run_investigate,
-    _investigate_impl,
-)
+# Name of the deployed Chalk Compute RemoteFunction we call by name.
+REMOTE_FN_NAME = "investigate_refund"
 
-# Run the agent on Chalk Compute by default; AGENT_REMOTE=0 runs it in-process.
-AGENT_REMOTE = os.environ.get("AGENT_REMOTE", "1") != "0"
-# When running remotely the function returns all events at once (the 2.0.0 generator
-# streaming path is broken); replay them with light pacing so the tree still animates.
-# The delay is jittered ±AGENT_REPLAY_JITTER around the base so it feels less mechanical.
-_REPLAY_DELAY = float(os.environ.get("AGENT_REPLAY_DELAY", "0.45"))
-_REPLAY_JITTER = float(os.environ.get("AGENT_REPLAY_JITTER", "0.4"))
+# ── Console trace link ─────────────────────────────────────────────────────────
+# Every call to the remote function is traced server-side. We can't mint the
+# console's per-span deep link client-side (operator/span ids are server-assigned),
+# but we can deep-link to the scaling group's flame-graph trace view scoped to the
+# call's time window — the user's run sits right at the top.
+CONSOLE_BASE = os.environ.get("CHALK_CONSOLE_BASE", "https://chalk.ai").rstrip("/")
+CONSOLE_PROJECT = os.environ.get("CHALK_CONSOLE_PROJECT", "cmpnck95f00090hs67kq4n6fb")
+ENV_ID = os.environ.get("CHALK_ENVIRONMENT_ID", "clk8fc4d2e1")
+_SG_FALLBACK = "investigate-refund"
 
-
-def _replay_pause() -> None:
-    """Sleep ~_REPLAY_DELAY with jitter so replayed events don't tick at a fixed cadence."""
-    low = _REPLAY_DELAY * (1.0 - _REPLAY_JITTER)
-    high = _REPLAY_DELAY * (1.0 + _REPLAY_JITTER)
-    time.sleep(random.uniform(max(0.0, low), high))
-
-_sessions: dict[str, list] = {}
+_remote_fn = None
 
 
-def _event_strings(messages: list, followup: bool):
-    """Yield JSON event strings from the agent — remote on Chalk Compute, or in-process.
+def _get_remote_fn():
+    """Lazily resolve a handle to the deployed investigate_refund function."""
+    global _remote_fn
+    if _remote_fn is None:
+        from chalkcompute import RemoteFunction
+        _remote_fn = RemoteFunction.from_name(REMOTE_FN_NAME)
+    return _remote_fn
 
-    Returns (iterator_of_event_strings, paced) where `paced` is True when the events
-    arrived all at once (remote) and should be replayed with a small delay.
+
+def _invoke(fn, *args):
+    """Make the remote/wire call to the deployed function.
+
+    chalk-sandbox-sdk#180 splits invocation Modal-style: `fn(...)` runs the local
+    Python body in-process, while `fn.remote(...)` makes the wire/RPC call. We
+    always want the deployment (sandbox + secrets), so prefer `.remote()` when the
+    SDK exposes it; older SDKs only have `__call__`, which is itself the wire call.
     """
-    payload = json.dumps(messages)
-    if AGENT_REMOTE:
-        # The whole investigation runs on Chalk Compute and comes back as one JSON
-        # array of event strings (see chalkcompute_agent_core.investigate).
-        events = json.loads(run_investigate(payload, followup))
-        return iter(events), True
-    return _investigate_impl(payload, followup), False
+    call = getattr(fn, "remote", None) or fn
+    return call(*args)
 
 
-def _producer(messages: list, followup: bool, q: queue.Queue, session_id: str) -> None:
-    """Drive the agent events onto the SSE queue, capturing the final session state."""
+def _scaling_group(fn) -> str:
+    """Scaling-group name for the function (drives the console URL path)."""
+    vi = getattr(fn, "version_info", None)
+    return (getattr(vi, "scaling_group_name", "") if vi else "") or _SG_FALLBACK
+
+
+def _trace_url(sg: str, start_s: float, end_s: float) -> str:
+    """Console flame-graph trace view for `sg`, windowed ±5min around the call."""
+    qs = urlencode({
+        "v": "remote-call-traces",
+        "ds": int(start_s * 1000) - 300_000,
+        "de": int(end_s * 1000) + 300_000,
+        "scalingGroupTraceView": "flame-graph",
+    })
+    return (f"{CONSOLE_BASE}/projects/{CONSOLE_PROJECT}"
+            f"/environments/{ENV_ID}/scaling-groups/{sg}?{qs}")
+
+
+# The agent's verdict keyword. Feature values in the trace never contain these
+# words, so the first match marks the boundary between trace and decision —
+# regardless of how the model spaces the verdict and its reasoning.
+_VERDICT_RE = re.compile(r"\b(APPROVE|DENY|ESCALATE)\b")
+
+
+def _split_verdict(raw: str) -> tuple[str | None, str]:
+    """Pull APPROVE/DENY/ESCALATE + reasoning out of the remote function's response.
+
+    The function returns `"{trace}\n\n{decision}"`. The decision leads with the
+    verdict, but the model may put a blank line between it and the reasoning, so
+    we locate the verdict keyword directly rather than relying on block splitting.
+    """
+    m = _VERDICT_RE.search(raw)
+    if not m:
+        return None, raw.strip()
+    reasoning = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", raw[m.end():]).strip(" :\n-")
+    return m.group(1), reasoning or raw[m.start():].strip()
+
+
+# A trace line is `  name(args) → result`, where result may span multiple lines
+# (the deployed function joins feature lookups with "\n"). Match each call's
+# result up to the next call's two-space-indented `name(` or end-of-trace.
+_STEP_RE = re.compile(r"^ {2}(\w+)\((.*?)\)\s*→\s*(.*?)(?=\n {2}\w+\(|\Z)",
+                      re.DOTALL | re.MULTILINE)
+# key=value pairs inside an args string. A value is a quoted string, a bracketed
+# list (the model sometimes passes features as a list repr), or a bare token.
+# Quoted/bracketed values may contain commas, so match those before the bare case.
+_ARG_RE = re.compile(r"(\w+)=('[^']*'|\"[^\"]*\"|\[[^\]]*\]|[^,]+)")
+
+
+def _trace_block(raw: str) -> str:
+    """The leading tool-call trace, i.e. everything before the verdict."""
+    m = _VERDICT_RE.search(raw)
+    return raw[:m.start()] if m else raw
+
+
+def _parse_args(args: str) -> dict:
+    """Turn an args string like `user_id=1, features='a,b'` into a dict."""
+    out: dict = {}
+    for k, v in _ARG_RE.findall(args):
+        v = v.strip().strip("'\"")
+        out[k] = int(v) if v.lstrip("-").isdigit() else v
+    return out
+
+
+def _step_label(name: str, args: str) -> str:
+    """Short node title for a tool call — feature short-names for get_chalk_features.
+
+    Handles features passed either as a comma-string or a list repr by pulling the
+    short name (after the last dot) out of every dotted feature path in the args.
+    """
+    if name == "get_chalk_features":
+        feats = re.findall(r"\b\w+\.(\w+)", args)
+        if feats:
+            shown = ", ".join(feats[:3])
+            return f"{shown} +{len(feats) - 3}" if len(feats) > 3 else shown
+    return name.replace("_", " ")
+
+
+def _parse_steps(raw: str) -> list[dict]:
+    """Reconstruct ordered tool-call steps from the flat trace block."""
+    steps = []
+    for i, (name, args, result) in enumerate(_STEP_RE.findall(_trace_block(raw))):
+        steps.append({
+            "id": f"s{i}",
+            "tool": name,
+            "label": _step_label(name, args),
+            "args": _parse_args(args),
+            "result": result.strip(),
+        })
+    return steps
+
+
+def _coerce_text(item) -> str:
+    """Normalize one streamed item to text.
+
+    Post-#180, fn.remote(...) on the deployed generator yields plain `str` deltas
+    (the agent's flat trace, character by character). Older/non-generator deploys
+    return a single `str`. Defensively also unwrap Arrow batches (result column).
+    """
+    if isinstance(item, (bytes, bytearray)):
+        return item.decode()
+    if isinstance(item, str):
+        return item
+    if hasattr(item, "to_pydict"):
+        vals = item.to_pydict().get("result") or []
+        return "".join(v if isinstance(v, str) else str(v) for v in vals)
+    return str(item)
+
+
+def _collect_raw(result) -> str:
+    """Drain the remote call into the full `"{trace}\n\n{verdict}"` text.
+
+    `fn.remote(...)` returns a scalar string or an iterator of text deltas. NB: the
+    compute transport currently buffers a generator's output and delivers every
+    yield at once on completion (verified: all chunks land at the same instant),
+    so iterating here does not give incremental wire-level streaming.
+    """
+    if isinstance(result, (str, bytes, bytearray)):
+        return _coerce_text(result)
+    return "".join(_coerce_text(item) for item in result)
+
+
+# Typing cadence for the simulated live reveal (see _producer).
+_TYPE_CHUNK = 12      # characters emitted per delta
+_TYPE_DELAY = 0.022   # seconds between delta slices
+
+
+def _producer(user_id: int, reason: str, q: queue.Queue) -> None:
+    """Run the agent, then reveal its output as a live, token-by-token stream.
+
+    Because the transport buffers (all yields arrive at once on completion), we
+    pace the server→browser emission ourselves: type the trace into the chat
+    transcript in slices and reveal each tree node (spinning → done) as its line
+    types out. If the platform later flushes yields incrementally, swap this paced
+    replay for a straight pass-through.
+    """
     try:
-        events, paced = _event_strings(messages, followup)
-        for s in events:
-            event = json.loads(s)
-            if event.get("type") == "_state":
-                _sessions[session_id] = event["messages"]
-                continue
-            q.put(event)
-            if paced and event.get("type") in ("plan", "tool_result", "hypothesis_update", "decision", "question"):
-                _replay_pause()
+        fn = _get_remote_fn()
+        sg = _scaling_group(fn)
+        t0 = time.time()
+        raw = _collect_raw(_invoke(fn, user_id, reason))
+        url = _trace_url(sg, t0, time.time())
+
+        verdict, text = _split_verdict(raw)
+        trace_block = _trace_block(raw)
+        matches = list(_STEP_RE.finditer(trace_block))
+        steps = _parse_steps(raw)
+
+        pos = 0
+        for i, m in enumerate(matches):
+            s = steps[i] if i < len(steps) else None
+            if s:
+                q.put({"type": "tree_node", "id": s["id"], "label": s["label"], "tool": s["tool"]})
+            seg = trace_block[pos:m.end()]
+            for j in range(0, len(seg), _TYPE_CHUNK):
+                q.put({"type": "delta", "text": seg[j:j + _TYPE_CHUNK]})
+                time.sleep(_TYPE_DELAY)
+            pos = m.end()
+            if s:
+                time.sleep(0.15)
+                q.put({"type": "tree_node_done", "id": s["id"], "result": s["result"]})
+                time.sleep(0.15)
+
+        tail = trace_block[pos:]
+        if tail.strip():
+            q.put({"type": "delta", "text": tail})
+
+        if verdict:
+            time.sleep(0.2)
+            q.put({"type": "decision", "verdict": verdict, "text": text, "trace_url": url})
+        else:
+            q.put({"type": "question", "text": text, "trace_url": url})
     except Exception as e:
         q.put({"type": "error", "message": str(e)})
     finally:
         q.put(None)
+
+
+def _producer_reply(q: queue.Queue) -> None:
+    """investigate_refund is stateless — explain that follow-ups aren't supported."""
+    q.put({"type": "question",
+           "text": "investigate_refund runs statelessly on Chalk Compute and doesn't "
+                   "carry conversation history — start a new investigation to run it again."})
+    q.put(None)
 
 
 async def _sse(q: queue.Queue):
@@ -133,14 +299,8 @@ async def index() -> HTMLResponse:
 @app.post("/investigate")
 async def investigate(req: InvestigateRequest) -> StreamingResponse:
     session_id = str(uuid.uuid4())
-    messages: list = [
-        {"role": "system",  "content": SYSTEM_PROMPT},
-        {"role": "user",    "content": f"User {req.user_id}. Refund reason: {req.reason!r}."},
-    ]
-    _sessions[session_id] = messages
-
     q: queue.Queue = queue.Queue()
-    threading.Thread(target=_producer, args=(messages, False, q, session_id), daemon=True).start()
+    threading.Thread(target=_producer, args=(req.user_id, req.reason, q), daemon=True).start()
 
     async def stream():
         yield f"data: {json.dumps({'type': 'session', 'id': session_id})}\n\n"
@@ -153,20 +313,10 @@ async def investigate(req: InvestigateRequest) -> StreamingResponse:
 
 @app.post("/reply/{session_id}")
 async def reply(session_id: str, req: ReplyRequest) -> StreamingResponse:
-    messages = _sessions.get(session_id)
-    if messages is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-    messages.append({"role": "user", "content": req.message + "\n\n(Answer this follow-up question directly and conversationally. Do not re-run the investigation or issue a new verdict.)"})
     q: queue.Queue = queue.Queue()
-    threading.Thread(target=_producer, args=(messages, True, q, session_id), daemon=True).start()
+    threading.Thread(target=_producer_reply, args=(q,), daemon=True).start()
     return StreamingResponse(_sse(q), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-
-@app.delete("/session/{session_id}")
-async def delete_session(session_id: str) -> dict:
-    _sessions.pop(session_id, None)
-    return {"ok": True}
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -179,7 +329,10 @@ HTML = r"""<!DOCTYPE html>
 <title>ACME Corp. Refund Investigator</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- Load fonts without blocking render: fetch as a print sheet, then promote to all
+     on load. A flaky/blocked font CDN can't stall the page — it falls back to system fonts. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" media="print" onload="this.media='all'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"></noscript>
 <style>
   :root {
     /* Chalk console — light surfaces */
@@ -282,7 +435,8 @@ HTML = r"""<!DOCTYPE html>
     border: 1px solid var(--border);
     background: var(--surface);
     box-shadow: var(--sh-s);
-    transition: background .3s, border-color .3s, opacity .3s, box-shadow .3s, transform .3s;
+    transition: background .3s, border-color .3s, opacity .3s, box-shadow .3s, transform .3s,
+                left .35s cubic-bezier(.16,1,.3,1);
   }
   #tree-source, #tree-conclusion { overflow: hidden; }
   .tree-node-label {
@@ -512,6 +666,22 @@ HTML = r"""<!DOCTYPE html>
   .tool-result-row.pending { color: var(--muted); }
   .tool-result-row.done    { color: var(--green-text); }
 
+  /* ── Live stream transcript ── */
+  .stream-pre {
+    font-family: 'JetBrains Mono', 'SF Mono', 'Menlo', monospace;
+    font-size: 12px; line-height: 1.55; color: var(--text2);
+    white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+    background: var(--tool-bg); border: 1px solid var(--tool-border);
+    border-left: 3px solid var(--accent); border-radius: 8px;
+    padding: 10px 14px; margin: 0; animation: rise 0.15s ease;
+  }
+  .stream-cursor {
+    display: inline-block; width: 7px; height: 13px; background: var(--accent);
+    margin-left: 2px; vertical-align: -2px; border-radius: 1px;
+    animation: blink 1s steps(1, end) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
   /* ── Thinking dots ── */
   .thinking { display: flex; align-items: center; gap: 5px; padding: 8px 2px; }
   .dot { width: 6px; height: 6px; background: var(--accent); border-radius: 50%; animation: pulse 1.2s ease-in-out infinite; }
@@ -528,6 +698,10 @@ HTML = r"""<!DOCTYPE html>
   .verdict-deny     .verdict-label { color: var(--red-text);   }
   .verdict-escalate .verdict-label { color: var(--amber-text); }
   .verdict-text { font-size: 13px; color: var(--text2); line-height: 1.55; }
+  .trace-link { display: inline-flex; align-items: center; gap: 4px; margin-top: 12px;
+    font-size: 12px; font-weight: 600; color: var(--accent); text-decoration: none;
+    border-top: 1px solid var(--line); padding-top: 10px; width: 100%; }
+  .trace-link:hover { text-decoration: underline; }
 
   /* ── Error ── */
   .error-card { background: var(--red-bg); border: 1px solid var(--red-bd); border-radius: 8px; padding: 10px 14px; font-size: 13px; color: var(--red-text); }
@@ -664,6 +838,13 @@ let sessionId      = null;
 let mode           = 'idle';
 let activeAgentMsg = null;
 let activeThinking = null;
+let activeStreamPre = null;
+
+function traceLinkHtml(url) {
+  if (!url) return '';
+  return `<a class="trace-link" href="${esc(url)}" target="_blank" rel="noopener">` +
+         `View the function trace ↗</a>`;
+}
 
 // ── Dropdown ──────────────────────────────────────────────────────────────────
 
@@ -739,6 +920,7 @@ function startInvestigation() {
   document.getElementById('appBody').style.display   = 'flex';
   document.getElementById('chat').innerHTML          = '';
   document.getElementById('newInvBtn').style.display = 'inline-block';
+  resetTree();
   showTreeHint('planning');
   setMode('thinking');
 
@@ -771,7 +953,7 @@ function sendReply() {
 }
 
 function dismiss() {
-  if (sessionId) { fetch(`/session/${sessionId}`, {method: 'DELETE'}).catch(() => {}); sessionId = null; }
+  sessionId = null;
   activeAgentMsg = null; activeThinking = null;
   currentUserId = null; currentReason = null;
 
@@ -807,8 +989,8 @@ function streamEvents(res) {
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const raw = line.slice(6).trim();
-        if (raw === '[DONE]') return;
-        try { handleEvent(JSON.parse(raw)); } catch (_) {}
+        if (raw === '[DONE]') { if (mode === 'thinking') setMode('done'); endTreeIfNoPlan(); return; }
+        try { handleEvent(JSON.parse(raw)); } catch (err) { console.error('handleEvent failed', err, raw); }
       }
       scrollBottom();
       read();
@@ -822,59 +1004,72 @@ function handleEvent(ev) {
   if (ev.type === 'session') {
     sessionId = ev.id;
 
-  } else if (ev.type === 'planning') {
-    showTreeHint('planning');
+  } else if (ev.type === 'delta') {
+    appendStream(ev.text);
 
-  } else if (ev.type === 'plan') {
-    buildTree(ev.steps);
+  } else if (ev.type === 'tree_node') {
+    ensureTreeScaffold();
+    addTreeNode({id: ev.id, label: ev.label, tool: ev.tool});
+    updateTreeHyp(ev.id, 'running');
 
-  } else if (ev.type === 'hypothesis_update') {
-    updateTreeHyp(ev.id, ev.status, ev.summary || '');
-
-  } else if (ev.type === 'tool_call') {
-    activeThinking.style.display = 'none';
-    const args = Object.entries(ev.args).map(([k,v]) => `${k}=${JSON.stringify(v)}`).join(', ');
-    const card = document.createElement('div');
-    card.className = 'tool-card'; card.id = 'tc-' + ev.id;
-    card.innerHTML =
-      `<div class="tool-header"><span>⚙</span><span class="tool-fn">${esc(ev.name)}</span>` +
-      `<span class="tool-args">(${esc(args)})</span></div>` +
-      `<div class="tool-result-row pending" id="tr-${esc(ev.id)}">${mkThinking().outerHTML}</div>`;
-    activeAgentMsg.insertBefore(card, activeThinking);
-
-  } else if (ev.type === 'tool_result') {
-    const tr = document.getElementById('tr-' + ev.id);
-    if (tr) { tr.className = 'tool-result-row done'; tr.innerHTML = `<span>→</span><span>${esc(ev.result)}</span>`; }
-    activeThinking.style.display = '';
+  } else if (ev.type === 'tree_node_done') {
+    updateTreeHyp(ev.id, 'done', ev.result || '');
 
   } else if (ev.type === 'question') {
-    activeThinking.remove(); activeThinking = null;
+    finalizeStream();
     const bubble = document.createElement('div');
     bubble.className = 'msg-question'; bubble.textContent = ev.text;
     activeAgentMsg.appendChild(bubble);
+    endTreeIfNoPlan();
     setMode('reply');
 
   } else if (ev.type === 'decision') {
-    activeThinking.remove(); activeThinking = null;
+    finalizeStream();
     const v = ev.verdict.toLowerCase();
 
     const card = document.createElement('div');
     card.className = `verdict-card verdict-${v}`;
-    card.innerHTML = `<div class="verdict-label">${esc(ev.verdict)}</div><div class="verdict-text">${esc(ev.text)}</div>`;
+    card.innerHTML = `<div class="verdict-label">${esc(ev.verdict)}</div>` +
+                     `<div class="verdict-text">${esc(ev.text)}</div>` +
+                     traceLinkHtml(ev.trace_url);
     activeAgentMsg.appendChild(card);
 
     renderTreeConclusion(ev.verdict, ev.text);
+    endTreeIfNoPlan();
     setMode('done');
 
   } else if (ev.type === 'error') {
-    activeThinking?.remove();
+    finalizeStream();
     const card = document.createElement('div');
     card.className = 'error-card'; card.textContent = '⚠ ' + ev.message;
     activeAgentMsg.appendChild(card);
+    endTreeIfNoPlan();
     setMode('done');
   }
 
   scrollBottom();
+}
+
+// Live transcript: text deltas type into a monospace block with a blinking cursor.
+function appendStream(text) {
+  if (!activeStreamPre) {
+    if (activeThinking) { activeThinking.remove(); activeThinking = null; }
+    const pre = document.createElement('div');
+    pre.className = 'stream-pre';
+    pre.innerHTML = '<span class="stream-text"></span><span class="stream-cursor"></span>';
+    activeAgentMsg.appendChild(pre);
+    activeStreamPre = pre;
+  }
+  activeStreamPre.querySelector('.stream-text').textContent += text;
+}
+
+function finalizeStream() {
+  if (activeThinking) { activeThinking.remove(); activeThinking = null; }
+  if (activeStreamPre) {
+    const cur = activeStreamPre.querySelector('.stream-cursor');
+    if (cur) cur.remove();
+    activeStreamPre = null;
+  }
 }
 
 // ── DOM helpers ───────────────────────────────────────────────────────────────
@@ -896,6 +1091,7 @@ function appendAgentMsg() {
   const el = document.createElement('div');
   el.className = 'msg-agent';
   const t = mkThinking(); el.appendChild(t); activeThinking = t;
+  activeStreamPre = null;
   document.getElementById('chat').appendChild(el);
   return el;
 }
@@ -922,6 +1118,7 @@ const PAD     = 10;    // bottom padding of the canvas
 let treeSteps = [];    // [{id,label,tool}, ...]
 let edgeCls   = {};    // edge id → highlight class, persisted across redraws
 let layout    = null;  // {n, centerX, cx:[...]}
+let treeReady = false; // scaffold (source + conclusion + svg) built?
 
 function showTreeHint(state) {
   const hint = document.getElementById('treeHint');
@@ -931,10 +1128,11 @@ function showTreeHint(state) {
   if (state === 'planning') {
     hint.classList.add('tree-planning');
     mark.textContent = '↻';
-    text.innerHTML   = 'Drafting the investigation plan…';
+    text.style.display = 'none';   // just the spinner — we're not only waiting on a plan
   } else {
     hint.classList.remove('tree-planning');
     mark.textContent = '⬡';
+    text.style.display = '';
     text.innerHTML   = "The agent's <b>hypothesis tree</b> renders here as it investigates.";
   }
 }
@@ -945,41 +1143,77 @@ function hideTreeHint() {
   hint.classList.remove('tree-planning');
 }
 
-function buildTree(steps) {
-  treeSteps = steps;
+// When a verdict/question/error lands but the agent never emitted a plan
+// (the deployed function returns a flat verdict, not a step-by-step plan), no
+// tree was built — so the planning spinner would otherwise spin forever. The
+// trace link lives in the verdict card, so just clear the hint here.
+function endTreeIfNoPlan() {
+  if (treeSteps.length > 0) return;
+  hideTreeHint();
+}
+
+// Build the fixed scaffold once (source + hidden conclusion + svg). Hypothesis
+// nodes are appended live as the agent issues tool calls.
+function ensureTreeScaffold() {
+  if (treeReady) return;
+  treeReady = true;
+  treeSteps = [];
   edgeCls   = {};
   hideTreeHint();
 
-  const canvas  = document.getElementById('treeCanvas');
-  const n       = steps.length;
-  const rowW    = n * NODE_W + (n - 1) * NODE_GAP;
-  const centerX = rowW / 2;
-  const cx      = steps.map((_, i) => i * (NODE_W + NODE_GAP) + NODE_W / 2);
-  layout = { n, centerX, cx };
-
-  canvas.style.width = rowW + 'px';
-
+  const canvas = document.getElementById('treeCanvas');
   const reason = currentReason ? `"${esc(currentReason)}"` : '';
-  let html = '<svg class="tree-svg" id="treeSvg" xmlns="http://www.w3.org/2000/svg"></svg>';
-  html += `<div class="tree-node" id="tree-source" style="left:${centerX - SRC_W / 2}px;top:0;width:${SRC_W}px;">`
-        +   `<div class="tree-node-label">Source · Refund Claim</div>`
-        +   `<div class="tree-node-title"><span class="mono">user_id=${esc(currentUserId)}</span> · ${reason}</div>`
-        + `</div>`;
-  steps.forEach((s, i) => {
-    html += `<div class="tree-node tree-hyp" id="tree-${esc(s.id)}" style="left:${i * (NODE_W + NODE_GAP)}px;top:${ROW_TOP}px;">`
-          +   `<div class="hyp-icon">○</div>`
-          +   `<div class="tree-node-title">${esc(s.label)}</div>`
-          +   `<div class="tree-node-summary" id="tree-${esc(s.id)}-summary"></div>`
-          + `</div>`;
-  });
-  html += `<div class="tree-node" id="tree-conclusion" style="left:${centerX - CONC_W / 2}px;width:${CONC_W}px;">`
-        +   `<div class="conc-label" id="tree-conc-label">—</div>`
-        +   `<div class="conc-text"  id="tree-conc-text"></div>`
-        + `</div>`;
-  canvas.innerHTML = html;
+  canvas.innerHTML =
+      '<svg class="tree-svg" id="treeSvg" xmlns="http://www.w3.org/2000/svg"></svg>'
+    + `<div class="tree-node" id="tree-source" style="top:0;width:${SRC_W}px;">`
+    +   `<div class="tree-node-label">Source · Refund Claim</div>`
+    +   `<div class="tree-node-title"><span class="mono">user_id=${esc(currentUserId)}</span> · ${reason}</div>`
+    + `</div>`
+    + `<div class="tree-node" id="tree-conclusion" style="width:${CONC_W}px;">`
+    +   `<div class="conc-label" id="tree-conc-label">—</div>`
+    +   `<div class="conc-text"  id="tree-conc-text"></div>`
+    + `</div>`;
 
   canvas.style.display = 'block';
   canvas.classList.remove('show'); void canvas.offsetWidth; canvas.classList.add('show');
+}
+
+// Append one hypothesis node and re-center the row (existing nodes slide).
+function addTreeNode(step) {
+  if (treeSteps.some(s => s.id === step.id)) return;
+  treeSteps.push(step);
+
+  const node = document.createElement('div');
+  node.className = 'tree-node tree-hyp';
+  node.id = `tree-${step.id}`;
+  node.style.top = ROW_TOP + 'px';
+  node.innerHTML =
+      `<div class="hyp-icon">○</div>`
+    + `<div class="tree-node-title">${esc(step.label)}</div>`
+    + `<div class="tree-node-summary" id="tree-${esc(step.id)}-summary"></div>`;
+  document.getElementById('treeCanvas').appendChild(node);
+
+  relayoutTree();
+}
+
+// Recompute the row geometry and reposition source / nodes / conclusion.
+function relayoutTree() {
+  const n = treeSteps.length;
+  if (!n) return;
+  const rowW    = n * NODE_W + (n - 1) * NODE_GAP;
+  const centerX = rowW / 2;
+  const cx      = treeSteps.map((_, i) => i * (NODE_W + NODE_GAP) + NODE_W / 2);
+  layout = { n, centerX, cx };
+
+  document.getElementById('treeCanvas').style.width = rowW + 'px';
+  const src = document.getElementById('tree-source');
+  if (src) src.style.left = (centerX - SRC_W / 2) + 'px';
+  treeSteps.forEach((s, i) => {
+    const el = document.getElementById(`tree-${s.id}`);
+    if (el) el.style.left = (i * (NODE_W + NODE_GAP)) + 'px';
+  });
+  const conc = document.getElementById('tree-conclusion');
+  if (conc) conc.style.left = (centerX - CONC_W / 2) + 'px';
 
   drawEdges();
 }
@@ -1078,7 +1312,7 @@ function renderTreeConclusion(verdict, text) {
 }
 
 function resetTree() {
-  treeSteps = []; edgeCls = {}; layout = null;
+  treeSteps = []; edgeCls = {}; layout = null; treeReady = false;
   const canvas = document.getElementById('treeCanvas');
   canvas.style.display = 'none'; canvas.classList.remove('show');
   canvas.innerHTML = ''; canvas.style.height = ''; canvas.style.width = '';
