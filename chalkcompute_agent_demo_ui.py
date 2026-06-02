@@ -360,6 +360,7 @@ HTML = r"""<!DOCTYPE html>
   .tree-node-summary {
     font-size: 11px; color: var(--muted); margin-top: 5px;
     line-height: 1.4; word-break: break-word; overflow-wrap: break-word;
+    white-space: pre-line;   /* keep each feature on its own line */
   }
 
   /* ── SOURCE node (position + size set by JS) ── */
@@ -383,7 +384,7 @@ HTML = r"""<!DOCTYPE html>
   }
   .tree-hyp.hyp-done {
     opacity: 1; transform: scale(1);
-    background: var(--green-bg); border-color: var(--green-bd); box-shadow: var(--sh-s);
+    background: var(--surface); border-color: var(--border-strong); box-shadow: var(--sh-s);
   }
   .tree-hyp.hyp-alert {
     opacity: 1; transform: scale(1);
@@ -423,6 +424,7 @@ HTML = r"""<!DOCTYPE html>
     transition: stroke .4s, stroke-width .4s;
   }
   .tree-svg .edge-active  { stroke: var(--accent); stroke-width: 2; }
+  .tree-svg .edge-visited { stroke: var(--border-strong); stroke-width: 2; }
   .tree-svg .edge-done    { stroke: var(--green); stroke-width: 2; }
   .tree-svg .edge-alert   { stroke: var(--amber); stroke-width: 2; }
   .tree-svg .edge-deny    { stroke: var(--red);   stroke-width: 2; }
@@ -1139,7 +1141,7 @@ function setEdge(id, cls) {
   if (cls) edgeCls[id] = cls; else delete edgeCls[id];
   const e = document.getElementById(id);
   if (!e) return;
-  e.classList.remove('edge-active','edge-done','edge-alert','edge-deny');
+  e.classList.remove('edge-active','edge-visited','edge-done','edge-alert','edge-deny');
   if (cls) e.classList.add(cls);
 }
 
@@ -1156,10 +1158,12 @@ function updateTreeHyp(id, status, summary) {
     icon.textContent = '↻'; icon.className = 'hyp-icon spinning';
     setEdge(`e-in-${id}`, 'edge-active');
   } else if (status === 'done') {
+    // "done" = lookup completed, not "passed" — keep it neutral so green doesn't
+    // imply a clean verdict. The verdict colour lives on the conclusion node only.
     node.classList.add('hyp-done');
-    icon.textContent = '✓'; icon.className = 'hyp-icon'; icon.style.color = 'var(--green-text)';
-    setEdge(`e-in-${id}`, 'edge-done');
-    setEdge(`e-out-${id}`, 'edge-done');
+    icon.textContent = '✓'; icon.className = 'hyp-icon'; icon.style.color = 'var(--muted)';
+    setEdge(`e-in-${id}`, 'edge-visited');
+    setEdge(`e-out-${id}`, 'edge-visited');
   } else if (status === 'alert') {
     node.classList.add('hyp-alert');
     icon.textContent = '⚠'; icon.className = 'hyp-icon'; icon.style.color = 'var(--amber)';
@@ -1168,7 +1172,7 @@ function updateTreeHyp(id, status, summary) {
   }
 
   if (sumEl && summary) {
-    sumEl.textContent = summary.length > 60 ? summary.slice(0, 57) + '…' : summary;
+    sumEl.textContent = summary.length > 220 ? summary.slice(0, 217) + '…' : summary;
   }
   drawEdges();
 }
