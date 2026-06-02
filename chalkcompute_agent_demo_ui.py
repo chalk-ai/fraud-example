@@ -774,11 +774,11 @@ function togglePacing() {
 }
 function updatePacingLabel() {
   const btn = document.getElementById('pacingToggle');
-  document.getElementById('pacingLabel').textContent = pacingOn ? 'paced reveal' : 'instant';
+  document.getElementById('pacingLabel').textContent = pacingOn ? 'chunked' : 'iteratable';
   btn.classList.toggle('off', !pacingOn);
   btn.title = pacingOn
-    ? 'Reveal is paced to read like a live investigation — click for instant'
-    : 'Renders all at once when the agent returns — click for paced reveal';
+    ? 'Chunked: staggered reveal — click to switch to iteratable'
+    : 'Iteratable: stream as the agent yields — click to switch to chunked';
 }
 
 function traceLinkHtml(url) {
