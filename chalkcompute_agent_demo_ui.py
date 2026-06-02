@@ -3,21 +3,13 @@
 # requires-python = ">=3.12,<3.14"
 # dependencies = ["fastapi", "uvicorn[standard]", "python-dotenv", "chalkcompute>=2.1.1"]
 # ///
-"""Refund-abuse agent demo UI.
+"""Refund-abuse agent demo UI — the web front end.
 
-Thin web front end over the deployed `investigate_refund` Chalk Compute function.
-We resolve it by name (RemoteFunction.from_name), call it with a user_id + refund
-reason, and surface its APPROVE/DENY/ESCALATE verdict in chat.
-
-The interesting part is what you DON'T see here: investigate_refund runs an
-agentic loop inside Chalk Compute, discovering and querying features on its own.
-Server-side tracing is on by default, so every call produces a flame graph in
-the Chalk console — the chat response links straight to it.
-
-Config (env, all optional):
-  CHALK_CONSOLE_BASE     console origin for the trace link (default https://chalk.ai)
-  CHALK_CONSOLE_PROJECT  project id for the trace link
-  CHALK_ENVIRONMENT_ID   environment id for the trace link
+This file is pure UI plumbing: a FastAPI server, an SSE event stream, and the
+HTML/CSS/JS for the chat + investigation tree. The actual Chalk Compute
+integration — resolving `investigate_refund`, calling it, and parsing its reply —
+lives in `chalk_client.py`. `_producer` is the bridge: it calls
+`chalk_client.investigate(...)` and turns the reply into UI events.
 
 Run:
   ./chalkcompute_agent_demo_ui.py 8123
@@ -26,180 +18,16 @@ Run:
 
 import asyncio
 import json
-import os
 import queue
-import re
-import sys
 import threading
 import time
 import uuid
-from urllib.parse import urlencode
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
-# RemoteFunction.from_name authenticates with CHALK_* creds from the environment.
-load_dotenv()
-
-# Name of the deployed Chalk Compute RemoteFunction we call by name.
-REMOTE_FN_NAME = "investigate_refund"
-
-# ── Console trace link ─────────────────────────────────────────────────────────
-# Every call to the remote function is traced server-side. We can't mint the
-# console's per-span deep link client-side (operator/span ids are server-assigned),
-# but we can deep-link to the scaling group's flame-graph trace view scoped to the
-# call's time window — the user's run sits right at the top.
-CONSOLE_BASE = os.environ.get("CHALK_CONSOLE_BASE", "https://chalk.ai").rstrip("/")
-CONSOLE_PROJECT = os.environ.get("CHALK_CONSOLE_PROJECT", "cmpnck95f00090hs67kq4n6fb")
-ENV_ID = os.environ.get("CHALK_ENVIRONMENT_ID", "clk8fc4d2e1")
-_SG_FALLBACK = "investigate-refund"
-
-_remote_fn = None
-
-
-def _get_remote_fn():
-    """Lazily resolve a handle to the deployed investigate_refund function."""
-    global _remote_fn
-    if _remote_fn is None:
-        from chalkcompute import RemoteFunction
-        _remote_fn = RemoteFunction.from_name(REMOTE_FN_NAME)
-    return _remote_fn
-
-
-def _invoke(fn, *args):
-    """Make the remote/wire call to the deployed function.
-
-    chalk-sandbox-sdk#180 splits invocation Modal-style: `fn(...)` runs the local
-    Python body in-process, while `fn.remote(...)` makes the wire/RPC call. We
-    always want the deployment (sandbox + secrets), so prefer `.remote()` when the
-    SDK exposes it; older SDKs only have `__call__`, which is itself the wire call.
-    """
-    call = getattr(fn, "remote", None) or fn
-    return call(*args)
-
-
-def _scaling_group(fn) -> str:
-    """Scaling-group name for the function (drives the console URL path)."""
-    vi = getattr(fn, "version_info", None)
-    return (getattr(vi, "scaling_group_name", "") if vi else "") or _SG_FALLBACK
-
-
-def _trace_url(sg: str, start_s: float, end_s: float) -> str:
-    """Console flame-graph trace view for `sg`, windowed ±5min around the call."""
-    qs = urlencode({
-        "v": "remote-call-traces",
-        "ds": int(start_s * 1000) - 300_000,
-        "de": int(end_s * 1000) + 300_000,
-        "scalingGroupTraceView": "flame-graph",
-    })
-    return (f"{CONSOLE_BASE}/projects/{CONSOLE_PROJECT}"
-            f"/environments/{ENV_ID}/scaling-groups/{sg}?{qs}")
-
-
-# The agent's verdict keyword. Feature values in the trace never contain these
-# words, so the first match marks the boundary between trace and decision —
-# regardless of how the model spaces the verdict and its reasoning.
-_VERDICT_RE = re.compile(r"\b(APPROVE|DENY|ESCALATE)\b")
-
-
-def _split_verdict(raw: str) -> tuple[str | None, str]:
-    """Pull APPROVE/DENY/ESCALATE + reasoning out of the remote function's response.
-
-    The function returns `"{trace}\n\n{decision}"`. The decision leads with the
-    verdict, but the model may put a blank line between it and the reasoning, so
-    we locate the verdict keyword directly rather than relying on block splitting.
-    """
-    m = _VERDICT_RE.search(raw)
-    if not m:
-        return None, raw.strip()
-    reasoning = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", raw[m.end():]).strip(" :\n-")
-    return m.group(1), reasoning or raw[m.start():].strip()
-
-
-# A trace line is `  name(args) → result`, where result may span multiple lines
-# (the deployed function joins feature lookups with "\n"). Match each call's
-# result up to the next call's two-space-indented `name(` or end-of-trace.
-_STEP_RE = re.compile(r"^ {2}(\w+)\((.*?)\)\s*→\s*(.*?)(?=\n {2}\w+\(|\Z)",
-                      re.DOTALL | re.MULTILINE)
-# key=value pairs inside an args string. A value is a quoted string, a bracketed
-# list (the model sometimes passes features as a list repr), or a bare token.
-# Quoted/bracketed values may contain commas, so match those before the bare case.
-_ARG_RE = re.compile(r"(\w+)=('[^']*'|\"[^\"]*\"|\[[^\]]*\]|[^,]+)")
-
-
-def _trace_block(raw: str) -> str:
-    """The leading tool-call trace, i.e. everything before the verdict."""
-    m = _VERDICT_RE.search(raw)
-    return raw[:m.start()] if m else raw
-
-
-def _parse_args(args: str) -> dict:
-    """Turn an args string like `user_id=1, features='a,b'` into a dict."""
-    out: dict = {}
-    for k, v in _ARG_RE.findall(args):
-        v = v.strip().strip("'\"")
-        out[k] = int(v) if v.lstrip("-").isdigit() else v
-    return out
-
-
-def _step_label(name: str, args: str) -> str:
-    """Short node title for a tool call — feature short-names for get_chalk_features.
-
-    Handles features passed either as a comma-string or a list repr by pulling the
-    short name (after the last dot) out of every dotted feature path in the args.
-    """
-    if name == "get_chalk_features":
-        feats = re.findall(r"\b\w+\.(\w+)", args)
-        if feats:
-            shown = ", ".join(feats[:3])
-            return f"{shown} +{len(feats) - 3}" if len(feats) > 3 else shown
-    return name.replace("_", " ")
-
-
-def _parse_steps(raw: str) -> list[dict]:
-    """Reconstruct ordered tool-call steps from the flat trace block."""
-    steps = []
-    for i, (name, args, result) in enumerate(_STEP_RE.findall(_trace_block(raw))):
-        steps.append({
-            "id": f"s{i}",
-            "tool": name,
-            "label": _step_label(name, args),
-            "args": _parse_args(args),
-            "result": result.strip(),
-        })
-    return steps
-
-
-def _coerce_text(item) -> str:
-    """Normalize one streamed item to text.
-
-    Post-#180, fn.remote(...) on the deployed generator yields plain `str` deltas
-    (the agent's flat trace, character by character). Older/non-generator deploys
-    return a single `str`. Defensively also unwrap Arrow batches (result column).
-    """
-    if isinstance(item, (bytes, bytearray)):
-        return item.decode()
-    if isinstance(item, str):
-        return item
-    if hasattr(item, "to_pydict"):
-        vals = item.to_pydict().get("result") or []
-        return "".join(v if isinstance(v, str) else str(v) for v in vals)
-    return str(item)
-
-
-def _collect_raw(result) -> str:
-    """Drain the remote call into the full `"{trace}\n\n{verdict}"` text.
-
-    `fn.remote(...)` returns a scalar string or an iterator of text deltas. NB: the
-    compute transport currently buffers a generator's output and delivers every
-    yield at once on completion (verified: all chunks land at the same instant),
-    so iterating here does not give incremental wire-level streaming.
-    """
-    if isinstance(result, (str, bytes, bytearray)):
-        return _coerce_text(result)
-    return "".join(_coerce_text(item) for item in result)
+import chalk_client  # the Chalk Compute integration: call the agent + parse its reply
 
 
 # Typing cadence for the simulated live reveal (see _producer).
@@ -208,42 +36,36 @@ _TYPE_DELAY = 0.022   # seconds between delta slices
 
 
 def _producer(user_id: int, reason: str, q: queue.Queue) -> None:
-    """Run the agent, then reveal its output as a live, token-by-token stream.
+    """Call the agent (chalk_client), then reveal its reply as a token-by-token stream.
 
-    Because the transport buffers (all yields arrive at once on completion), we
-    pace the server→browser emission ourselves: type the trace into the chat
-    transcript in slices and reveal each tree node (spinning → done) as its line
-    types out. If the platform later flushes yields incrementally, swap this paced
-    replay for a straight pass-through.
+    The agent's reply is the flat `"{trace}\n\n{verdict}"` text. We pace the
+    server→browser emission ourselves — type the trace into the chat transcript in
+    slices and reveal each tree node (spinning → done) as its line types out —
+    because the compute transport buffers the agent's output to completion. If the
+    platform later flushes incrementally, this paced replay becomes a pass-through.
     """
     try:
-        fn = _get_remote_fn()
-        sg = _scaling_group(fn)
         t0 = time.time()
-        raw = _collect_raw(_invoke(fn, user_id, reason))
-        url = _trace_url(sg, t0, time.time())
+        raw = chalk_client.investigate(user_id, reason)
+        url = chalk_client.trace_url(t0, time.time())
 
-        verdict, text = _split_verdict(raw)
-        trace_block = _trace_block(raw)
-        matches = list(_STEP_RE.finditer(trace_block))
-        steps = _parse_steps(raw)
+        verdict, text = chalk_client.split_verdict(raw)
+        trace = chalk_client.trace_block(raw)
+        steps = chalk_client.parse_steps(raw)
 
         pos = 0
-        for i, m in enumerate(matches):
-            s = steps[i] if i < len(steps) else None
-            if s:
-                q.put({"type": "tree_node", "id": s["id"], "label": s["label"], "tool": s["tool"]})
-            seg = trace_block[pos:m.end()]
+        for s in steps:
+            q.put({"type": "tree_node", "id": s["id"], "label": s["label"], "tool": s["tool"]})
+            seg = trace[pos:s["end"]]
             for j in range(0, len(seg), _TYPE_CHUNK):
                 q.put({"type": "delta", "text": seg[j:j + _TYPE_CHUNK]})
                 time.sleep(_TYPE_DELAY)
-            pos = m.end()
-            if s:
-                time.sleep(0.15)
-                q.put({"type": "tree_node_done", "id": s["id"], "result": s["result"]})
-                time.sleep(0.15)
+            pos = s["end"]
+            time.sleep(0.15)
+            q.put({"type": "tree_node_done", "id": s["id"], "result": s["result"]})
+            time.sleep(0.15)
 
-        tail = trace_block[pos:]
+        tail = trace[pos:]
         if tail.strip():
             q.put({"type": "delta", "text": tail})
 
