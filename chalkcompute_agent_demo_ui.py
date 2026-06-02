@@ -526,16 +526,8 @@ HTML = r"""<!DOCTYPE html>
     display: flex; flex-direction: column; gap: 12px; animation: rise .55s ease;
   }
   .composer-row { display: flex; gap: 10px; align-items: stretch; }
-  .composer .user-sel { flex-shrink: 0; }
-  .composer .user-sel-btn { height: 100%; }
-  .composer-input {
-    flex: 1; background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
-    padding: 11px 16px; color: var(--text); font-size: 14px; font-family: inherit; outline: none;
-    transition: border-color .15s, box-shadow .15s;
-  }
-  .composer-input::placeholder { color: var(--muted); }
-  .composer-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgb(22 136 62 / .12); }
-  .composer-input:disabled { opacity: .5; }
+  .composer .user-sel { flex: 1; }
+  .composer .user-sel-btn { width: 100%; height: 100%; justify-content: space-between; }
   .composer-go {
     background: linear-gradient(180deg, #177F65 0%, #12654F 100%); color: #fff; border: none;
     border-radius: 9px; padding: 12px; font-size: 14px; font-weight: 600; font-family: inherit;
@@ -690,10 +682,6 @@ HTML = r"""<!DOCTYPE html>
             </div>
           </div>
         </div>
-        <input id="startInput" class="composer-input" type="text"
-               placeholder="Refund reason appears here…"
-               disabled
-               onkeydown="if(event.key==='Enter')startInvestigation()">
       </div>
       <button id="startBtn" class="composer-go" onclick="startInvestigation()" disabled>Investigate →</button>
     </div>
@@ -737,6 +725,7 @@ HTML = r"""<!DOCTYPE html>
 
 <script>
 let selectedUser   = null;
+let selectedReason = null;
 let selectedOrder  = null;
 let currentUserId  = null;
 let currentReason  = null;
@@ -763,21 +752,16 @@ function toggleDropdown() {
   btn.classList.toggle('open', !open);
 }
 
-// Pick one of the canned refund claims. The reason is mocked (not user-entered)
-// and shown read-only in the composer so it's visible before Investigate.
+// Pick one of the canned refund claims. The mocked reason rides along with the
+// selection (shown in the dropdown itself) — no separate input needed.
 function selectUser(id, reason, order) {
   selectedUser = id;
+  selectedReason = reason;
   selectedOrder = order;
 
-  const label = document.getElementById('userSelLabel');
-  label.textContent = `#${order} · user_id=${id}`;
+  document.getElementById('userSelLabel').textContent = `#${order} · user_id=${id}`;
   document.getElementById('userSelBtn').className = `user-sel-btn`;
   document.getElementById('userDropdown').style.display = 'none';
-
-  const input = document.getElementById('startInput');
-  input.value    = reason;
-  input.disabled = false;   // full opacity…
-  input.readOnly = true;    // …but not editable (the claim is pre-set)
   document.getElementById('startBtn').disabled = false;
 }
 
@@ -816,8 +800,7 @@ function setMode(m) {
 
 function startInvestigation() {
   if (!selectedUser) return;
-  const reason = document.getElementById('startInput').value.trim();
-  if (!reason) return;
+  const reason = selectedReason;
 
   currentUserId = selectedUser;
   currentReason = reason;
@@ -874,11 +857,8 @@ function dismiss() {
   document.getElementById('startView').style.display = 'flex';
 
   // Reset composer.
-  selectedUser = null; selectedOrder = null;
+  selectedUser = null; selectedReason = null; selectedOrder = null;
   document.getElementById('userSelLabel').textContent = 'Select a claim';
-  const si = document.getElementById('startInput');
-  si.value = ''; si.placeholder = 'Refund reason appears here…';
-  si.disabled = true; si.readOnly = false;
   document.getElementById('startBtn').disabled = true;
   mode = 'idle';
 }
