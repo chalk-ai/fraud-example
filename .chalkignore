@@ -16,3 +16,16 @@ clients
 # Typically, you'll ignore the directory in which you're
 # writing notebooks and scripts.
 datascience
+
+# chalkcompute demo scripts — run directly, not deployed via chalk apply
+chalkcompute_agent_demo.py
+chalkcompute_vllm_server.py
+
+# Pre-existing example files not part of the refund-abuse demo
+src/models.py
+src/datasources.py
+src/resolvers.py
+src/mocks
+src/balance.chalk.sql
+src/transaction.chalk.sql
+src/user.chalk.sql
