@@ -168,7 +168,10 @@ def _producer(user_id: int, reason: str, q: queue.Queue, paced: bool = True) -> 
         q.put({"type": "status", "text": "Agent investigating…"})
 
         t0 = time.time()
-        raw = chalk_client.investigate(user_id, reason)
+        # investigate() yields chunks; drain to the full "{trace}\n\n{verdict}"
+        # text the tree + verdict parsing need. (Joining is why this isn't live —
+        # the tree is built from the complete trace, not streamed token by token.)
+        raw = "".join(chalk_client.investigate(user_id, reason))
         url = trace_url(t0, time.time())
 
         verdict, text = split_verdict(raw)
