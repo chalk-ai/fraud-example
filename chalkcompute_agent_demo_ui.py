@@ -536,8 +536,9 @@ HTML = r"""<!DOCTYPE html>
     background: var(--accent-soft); border: 1px solid var(--green-bd);
     border-radius: 14px 14px 4px 14px; padding: 11px 15px; animation: rise 0.2s ease;
   }
-  .msg-user-ref    { font-size: 11px; color: var(--text2); font-family: 'JetBrains Mono','SF Mono',monospace; margin-bottom: 4px; }
   .msg-user-reason { font-size: 14px; line-height: 1.4; color: var(--text); }
+  .msg-user-reason .mono { font-size: 13px; }
+  .msg-user-claim  { font-size: 13px; line-height: 1.4; color: var(--text2); margin-top: 5px; }
   .msg-reply {
     align-self: flex-end; max-width: 420px;
     background: var(--surface2); border: 1px solid var(--border);
@@ -955,8 +956,9 @@ function finalizeStatus(doneText) {
 function appendUserBubble(userId, reason, order) {
   const el = document.createElement('div');
   el.className = 'msg-user';
-  el.innerHTML = `<div class="msg-user-ref">Order #${esc(order)} · user_id=${esc(userId)}</div>` +
-                 `<div class="msg-user-reason">${esc(reason)}</div>`;
+  el.innerHTML = `<div class="msg-user-reason">Please investigate ` +
+                 `<span class="mono">Order #${esc(order)} · user_id=${esc(userId)}</span></div>` +
+                 `<div class="msg-user-claim">“${esc(reason)}”</div>`;
   document.getElementById('chat').appendChild(el);
 }
 
