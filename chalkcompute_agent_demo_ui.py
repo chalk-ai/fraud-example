@@ -160,7 +160,7 @@ def trace_url(agent, start_s: float, end_s: float) -> str:
 
 
 def _race_modes(user_id: int, reason: str, q: queue.Queue,
-                first_chunk_timeout: float = 8.0,
+                first_chunk_timeout: float = 5.0,
                 overall_timeout: float = 180.0):
     """Fire the streaming and chunked agents at once; pick whichever serves.
 
