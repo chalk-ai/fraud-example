@@ -479,6 +479,12 @@ HTML = r"""<!DOCTYPE html>
     display: flex; flex-direction: column; gap: 2px;
     z-index: 100; animation: rise 0.15s ease;
   }
+  .dropdown-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 4px 12px 8px; margin-bottom: 2px; border-bottom: 1px solid var(--border);
+    font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--faint);
+  }
   .user-option {
     display: flex; flex-direction: column; align-items: stretch; gap: 5px;
     padding: 10px 12px; border-radius: 7px; cursor: pointer; transition: background 0.1s; user-select: none;
@@ -659,6 +665,10 @@ HTML = r"""<!DOCTYPE html>
             <span class="user-sel-chevron">▾</span>
           </button>
           <div class="user-dropdown" id="userDropdown" style="display:none">
+            <div class="dropdown-head">
+              <span>Refund claim</span>
+              <span>Account fraud risk</span>
+            </div>
             <div class="user-option" onclick="selectUser(3, 'Item arrived damaged', '10482')">
               <div class="user-option-top">
                 <span class="user-option-id">#10482 · user_id=3</span>
